@@ -1,4 +1,3 @@
-<?xml version="1.0"?>
 <?php
 
 declare(strict_types=1);
