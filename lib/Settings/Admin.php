@@ -5,7 +5,7 @@ declare(strict_types=1);
 namespace OCA\S3ShadowMigrator\Settings;
 
 use OCP\Settings\ISettings;
-use OCP\Template;
+use OCP\AppFramework\Http\TemplateResponse;
 use OCP\IConfig;
 
 class Admin implements ISettings {
@@ -15,7 +15,7 @@ class Admin implements ISettings {
         $this->config = $config;
     }
 
-    public function getForm(): \OCP\Template {
+    public function getForm() {
         $parameters = [
             'auto_upload_enabled' => $this->config->getAppValue('s3shadowmigrator', 'auto_upload_enabled', 'no'),
             'batch_limit_files' => $this->config->getAppValue('s3shadowmigrator', 'batch_limit_files', '500'),
@@ -27,7 +27,7 @@ class Admin implements ISettings {
             's3_secret' => $this->config->getAppValue('s3shadowmigrator', 's3_secret', ''),
         ];
 
-        return new Template('s3shadowmigrator', 'settings-admin', $parameters);
+        return new TemplateResponse('s3shadowmigrator', 'settings-admin', $parameters);
     }
 
     public function getSection(): string {

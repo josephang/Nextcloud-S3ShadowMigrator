@@ -1,4 +1,4 @@
-<?php script('s3shadowmigrator', 'settings-admin'); ?>
+
 <div id="s3shadowmigrator-settings" class="section">
     <h2><?php p($l->t('S3 Shadow Migrator')); ?></h2>
     <p>
