@@ -233,6 +233,10 @@ class SelfHealingService {
      * Throws on unexpected S3 errors (network, auth, etc).
      */
     private function verifyS3Object(string $s3Key): bool {
+        if ($s3Key === '') {
+            return false;
+        }
+
         try {
             $s3Config = S3ConfigHelper::getS3Config($this->config, $this->db);
             $s3 = S3ConfigHelper::createS3Client($s3Config);
