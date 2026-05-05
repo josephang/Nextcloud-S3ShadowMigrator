@@ -44,16 +44,21 @@ class S3MigrationService {
             $key = $this->config->getAppValue('s3shadowmigrator', 's3_key', '');
             $secret = $this->config->getAppValue('s3shadowmigrator', 's3_secret', '');
 
-            $this->s3Client = new S3Client([
+            $s3Config = [
                 'version' => 'latest',
                 'region'  => $region,
-                'endpoint' => $endpoint,
                 'use_path_style_endpoint' => true,
                 'credentials' => [
                     'key'    => $key,
                     'secret' => $secret,
                 ],
-            ]);
+            ];
+
+            if (!empty($endpoint)) {
+                $s3Config['endpoint'] = $endpoint;
+            }
+
+            $this->s3Client = new S3Client($s3Config);
         }
         return $this->s3Client;
     }
@@ -120,7 +125,8 @@ class S3MigrationService {
 
         try {
             $localPhysicalPath = $this->config->getSystemValue('datadirectory', '/var/www/nextcloud/data') . '/' . $internalPath;
-            if (!file_exists($localPhysicalPath)) {
+            if (!file_exists($localPhysicalPath) || !is_writable($localPhysicalPath)) {
+                $this->logger->info("File ID {$fileId} is missing or not writable. Skipping migration.", ['app' => 's3shadowmigrator']);
                 $node->unlock(ILockingProvider::LOCK_EXCLUSIVE);
                 return false;
             }

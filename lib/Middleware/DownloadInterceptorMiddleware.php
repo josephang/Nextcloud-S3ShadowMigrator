@@ -43,16 +43,21 @@ class DownloadInterceptorMiddleware {
             $key = $this->config->getAppValue('s3shadowmigrator', 's3_key', '');
             $secret = $this->config->getAppValue('s3shadowmigrator', 's3_secret', '');
 
-            $this->s3Client = new S3Client([
+            $s3Config = [
                 'version' => 'latest',
                 'region'  => $region,
-                'endpoint' => $endpoint,
                 'use_path_style_endpoint' => true,
                 'credentials' => [
                     'key'    => $key,
                     'secret' => $secret,
                 ],
-            ]);
+            ];
+
+            if (!empty($endpoint)) {
+                $s3Config['endpoint'] = $endpoint;
+            }
+
+            $this->s3Client = new S3Client($s3Config);
         }
         return $this->s3Client;
     }
@@ -61,6 +66,22 @@ class DownloadInterceptorMiddleware {
      * Intercept a download request. Returns true if redirect occurred and execution should stop.
      */
     public function interceptDownload(File $node): bool {
+        // 0. Only intercept GET requests on specific download routes to prevent breaking internal reads (thumbnails, syncs)
+        if ($this->request->getMethod() !== 'GET') {
+            return false;
+        }
+
+        $uri = $this->request->getRequestUri();
+        $isDownloadRoute = (
+            strpos($uri, '/download') !== false || 
+            strpos($uri, '/remote.php/webdav') !== false || 
+            strpos($uri, '/remote.php/dav/files') !== false
+        );
+
+        if (!$isDownloadRoute) {
+            return false;
+        }
+
         // 1. User Agent Check for older Desktop Sync Clients
         $userAgent = $this->request->getHeader('User-Agent');
         if (strpos((string)$userAgent, 'mirall') !== false || strpos((string)$userAgent, 'Nextcloud-') !== false) {
