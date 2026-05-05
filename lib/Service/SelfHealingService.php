@@ -168,6 +168,13 @@ class SelfHealingService {
 
         // Corrupt-A: local still has content (null bytes from old ftruncate bug), S3 is fine, AND ETags match (file was not modified)
         if ($localExists && $localSize > 0 && $s3Exists && $etagMatches) {
+            // Ultimate safety net: if the file was modified on disk in the last 5 minutes, leave it alone.
+            // This prevents race conditions if a user is actively saving a file and the DB hasn't committed the new ETag yet.
+            if (filemtime($localPath) > time() - 300) {
+                $this->writeLiveLog(sprintf('⏳ Info [ID %d]: file modified very recently. Delaying Corrupt-A fix to prevent race conditions.', $fileId));
+                return 'healthy';
+            }
+
             $this->writeLiveLog(sprintf('🔧 Corrupt-A [ID %d]: local file is %d bytes (should be 0). Re-truncating.', $fileId, $localSize));
             $f = fopen($localPath, 'w');
             if ($f) {
