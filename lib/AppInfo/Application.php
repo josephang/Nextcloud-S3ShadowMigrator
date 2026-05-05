@@ -33,13 +33,7 @@ class Application extends App implements IBootstrap {
             $middleware->interceptDownload($event->getNode());
         });
         
-        // Register frontend scripts specifically for the files app
-        if (class_exists(\OCA\Files\Event\LoadAdditionalScriptsEvent::class)) {
-            $eventDispatcher->addListener(\OCA\Files\Event\LoadAdditionalScriptsEvent::class, function() {
-                \OCP\Util::addScript(self::APP_ID, 'fileactions');
-            });
-        } else {
-            \OCP\Util::addScript(self::APP_ID, 'fileactions');
-        }
+        // Register frontend scripts globally to ensure it loads
+        \OCP\Util::addScript(self::APP_ID, 'fileactions');
     }
 }

@@ -24,6 +24,10 @@
         <job>OCA\S3ShadowMigrator\BackgroundJob\ShadowMigrationJob</job>
     </background-jobs>
 
+    <commands>
+        <command>OCA\S3ShadowMigrator\Command\MigrateFileCommand</command>
+    </commands>
+
     <settings>
         <admin>OCA\S3ShadowMigrator\Settings\Admin</admin>
 
