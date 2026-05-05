@@ -34,7 +34,8 @@ class MigrateFileCommand extends Command {
             ->setName('s3shadowmigrator:migrate-file')
             ->setDescription('Manually migrates a single specific file to S3, or runs a batch drain.')
             ->addArgument('fileid', InputArgument::OPTIONAL, 'The numeric oc_filecache fileid to migrate. Omit to run a batch.')
-            ->addOption('batch', 'b', InputOption::VALUE_OPTIONAL, 'Number of files to migrate in batch mode', 100);
+            ->addOption('batch', 'b', InputOption::VALUE_OPTIONAL, 'Number of files to migrate in batch mode', 100)
+            ->addOption('max-size', null, InputOption::VALUE_OPTIONAL, 'Only migrate files smaller than this size in bytes (0 = no limit)', 0);
     }
 
     protected function execute(InputInterface $input, OutputInterface $output): int {
@@ -72,11 +73,29 @@ class MigrateFileCommand extends Command {
             }
         } else {
             // Batch mode
-            $batchLimit = max(1, min(5000, (int)$input->getOption('batch')));
-            $output->writeln("Running batch drain of up to {$batchLimit} files from local storage to S3...");
+            $batchLimit  = max(1, min(50000, (int)$input->getOption('batch')));
+            $maxSizeBytes = max(0, (int)$input->getOption('max-size'));
+            $sizeLabel = $maxSizeBytes > 0 ? ' (max ' . round($maxSizeBytes/1024/1024, 1) . ' MB each)' : '';
+            $output->writeln("Running batch drain of up to {$batchLimit} files{$sizeLabel}...");
 
-            $migrated = $this->migrationService->migrateBatch($batchLimit);
-            $output->writeln("<info>✓ Batch complete: {$migrated} files migrated.</info>");
+            $filesToMigrate = $this->migrationService->getLocalFilesToMigrate($batchLimit, $s3StorageId, $maxSizeBytes);
+            $count = count($filesToMigrate);
+
+            if ($count === 0) {
+                $output->writeln("<info>No local files found to migrate. Drain is complete.</info>");
+                return Command::SUCCESS;
+            }
+
+            $progressBar = new \Symfony\Component\Console\Helper\ProgressBar($output, $count);
+            $progressBar->start();
+
+            $migrated = $this->migrationService->migrateBatch($batchLimit, $maxSizeBytes, function() use ($progressBar) {
+                $progressBar->advance();
+            });
+
+            $progressBar->finish();
+            $output->writeln("");
+            $output->writeln("Batch complete: {$migrated} files migrated.");
             return Command::SUCCESS;
         }
     }

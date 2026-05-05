@@ -100,12 +100,7 @@ class DownloadInterceptorMiddleware {
             return false;
         }
 
-        // Pass through for Desktop Sync Clients - they can panic on 302 redirects in WebDAV context
-        $userAgent = (string)$this->request->getHeader('User-Agent');
-        if (str_contains($userAgent, 'mirall') || str_contains($userAgent, 'Nextcloud-') || str_contains($userAgent, 'ownCloud-')) {
-            $this->logger->debug('S3ShadowMigrator bypassing redirect for Desktop Client: ' . $userAgent, ['app' => 's3shadowmigrator']);
-            return false;
-        }
+
 
         // Bypass encrypted files - they MUST be decrypted server-side
         if ($this->encryptionManager->isReady()) {
@@ -122,12 +117,6 @@ class DownloadInterceptorMiddleware {
             }
         }
 
-        // Check if this file is on our target S3 mount
-        $s3BucketIdentifier = $this->config->getAppValue('s3shadowmigrator', 's3_bucket_identifier', '');
-        if (empty($s3BucketIdentifier)) {
-            return false;
-        }
-
         try {
             $fileStorageId = $node->getStorage()->getId();
         } catch (\Exception $e) {
@@ -135,11 +124,20 @@ class DownloadInterceptorMiddleware {
             return false;
         }
 
-        // BUG FIX: The original check used str_starts_with($fileStorageId, 's3::') as a fallback,
-        // which would intercept ANY S3 external storage, not just ours. This could break
-        // downloads from other S3 mounts on the server. Match ONLY our configured identifier.
-        if ($fileStorageId !== $s3BucketIdentifier) {
+        // Extract username from storage ID
+        $username = null;
+        if (str_starts_with($fileStorageId, 'home::')) {
+            $username = substr($fileStorageId, strlen('home::'));
+        }
+
+        if (empty($username)) {
             return false;
+        }
+
+        // Check if file is sparse AND hasn't been locally overwritten (ETags match)
+        $updater = new \OCA\S3ShadowMigrator\Db\FileCacheUpdater($this->db, $this->logger);
+        if (!$updater->isFileSparse($node->getId(), (string)$node->getEtag())) {
+            return false; // Not a migrated sparse file, or it was overwritten locally
         }
 
         // Generate Pre-signed URL and Redirect
@@ -152,7 +150,8 @@ class DownloadInterceptorMiddleware {
                 return false;
             }
 
-            $s3Key = $node->getInternalPath();
+            // Construct the expected S3 key: username/files/path...
+            $s3Key = $username . '/' . ltrim($node->getInternalPath(), '/');
 
             $cmd = $s3->getCommand('GetObject', [
                 'Bucket'                     => $bucketName,

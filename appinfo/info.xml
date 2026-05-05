@@ -26,6 +26,8 @@
 
     <commands>
         <command>OCA\S3ShadowMigrator\Command\MigrateFileCommand</command>
+        <command>OCA\S3ShadowMigrator\Command\GcCommand</command>
+        <command>OCA\S3ShadowMigrator\Command\RestoreUserCommand</command>
     </commands>
 
     <settings>

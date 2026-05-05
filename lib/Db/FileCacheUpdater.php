@@ -38,31 +38,84 @@ class FileCacheUpdater {
     }
 
     /**
-     * Executes transactional UPDATE on the PostgreSQL oc_filecache table.
-     * Swaps the storage ID integer and updates the path/path_hash to point to the remote S3 object.
+     * Executes transactional UPSERT on the PostgreSQL oc_s3shadow_files table
+     * to mark a file as migrated (sparse) with its current ETag and S3 Key.
      *
      * @param int $fileId The file cache ID
-     * @param int $newStorageId The S3 numeric storage ID
-     * @param string $newPath The target S3 path/key
+     * @param string $etag The file's ETag
+     * @param string $s3Key The file's destination key in S3
      * @return bool True on success
      */
-    public function migrateFileRecord(int $fileId, int $newStorageId, string $newPath): bool {
+    public function markFileAsSparse(int $fileId, string $etag, string $s3Key): bool {
         $this->db->beginTransaction();
         try {
+            // Check if exists first to do an UPSERT
             $query = $this->db->getQueryBuilder();
-            $query->update('filecache')
-                  ->set('storage', $query->createNamedParameter($newStorageId))
-                  ->set('path', $query->createNamedParameter($newPath))
-                  ->set('path_hash', $query->createNamedParameter(md5($newPath)))
-                  ->where($query->expr()->eq('fileid', $query->createNamedParameter($fileId)));
+            $query->select('fileid')->from('s3shadow_files')->where($query->expr()->eq('fileid', $query->createNamedParameter($fileId)));
+            $exists = $query->executeQuery()->fetch();
+
+            $query = $this->db->getQueryBuilder();
+            if ($exists) {
+                $query->update('s3shadow_files')
+                      ->set('migrated_at', $query->createNamedParameter(date('Y-m-d H:i:s')))
+                      ->set('migrated_etag', $query->createNamedParameter($etag))
+                      ->set('s3_key', $query->createNamedParameter($s3Key))
+                      ->where($query->expr()->eq('fileid', $query->createNamedParameter($fileId)));
+            } else {
+                $query->insert('s3shadow_files')
+                      ->values([
+                          'fileid' => $query->createNamedParameter($fileId),
+                          'migrated_at' => $query->createNamedParameter(date('Y-m-d H:i:s')),
+                          'migrated_etag' => $query->createNamedParameter($etag),
+                          's3_key' => $query->createNamedParameter($s3Key)
+                      ]);
+            }
 
             $affected = $query->executeStatement();
             
             $this->db->commit();
-            return $affected > 0;
+            return true;
         } catch (\Exception $e) {
             $this->db->rollBack();
-            $this->logger->error('Failed to update file cache during shadow migration: ' . $e->getMessage(), [
+            $this->logger->error('Failed to mark file as sparse during shadow migration: ' . $e->getMessage(), [
+                'app' => 's3shadowmigrator',
+                'exception' => $e
+            ]);
+            return false;
+        }
+    }
+
+    /**
+     * Checks if a file is marked as sparse in the custom tracking table,
+     * AND verifies that the ETag hasn't changed (which would mean it was overwritten locally).
+     *
+     * @param int $fileId The file cache ID
+     * @param string $currentEtag The current ETag from oc_filecache
+     * @return bool True if the file is sparse AND ETags match
+     */
+    public function isFileSparse(int $fileId, string $currentEtag = ''): bool {
+        try {
+            $query = $this->db->getQueryBuilder();
+            $query->select('migrated_etag')
+                  ->from('s3shadow_files')
+                  ->where($query->expr()->eq('fileid', $query->createNamedParameter($fileId)));
+
+            $result = $query->executeQuery();
+            $row = $result->fetch();
+            
+            if ($row === false) {
+                return false;
+            }
+
+            // If an ETag is provided, ensure it matches
+            if ($currentEtag !== '' && isset($row['migrated_etag']) && $row['migrated_etag'] !== $currentEtag) {
+                // The file was overwritten locally. It is no longer a valid sparse file.
+                return false;
+            }
+
+            return true;
+        } catch (\Exception $e) {
+            $this->logger->error('Failed to check if file is sparse: ' . $e->getMessage(), [
                 'app' => 's3shadowmigrator',
                 'exception' => $e
             ]);

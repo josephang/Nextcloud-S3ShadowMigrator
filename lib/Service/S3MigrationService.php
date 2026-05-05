@@ -75,7 +75,7 @@ class S3MigrationService {
      * Main batch entry point called by the cron job and CLI command.
      * Drains local home storage files into the configured S3/B2 bucket.
      */
-    public function migrateBatch(int $limit = 500): int {
+    public function migrateBatch(int $limit = 500, int $maxSizeBytes = 0, ?callable $progressCallback = null): int {
         $s3BucketIdentifier = $this->config->getAppValue('s3shadowmigrator', 's3_bucket_identifier', '');
         if (empty($s3BucketIdentifier)) {
             $this->logger->warning('S3ShadowMigrator: target bucket identifier is not configured.', ['app' => 's3shadowmigrator']);
@@ -88,7 +88,7 @@ class S3MigrationService {
             return 0;
         }
 
-        $filesToMigrate = $this->getLocalFilesToMigrate($limit, $s3StorageId);
+        $filesToMigrate = $this->getLocalFilesToMigrate($limit, $s3StorageId, $maxSizeBytes);
         $count = count($filesToMigrate);
 
         if ($count === 0) {
@@ -104,11 +104,17 @@ class S3MigrationService {
             $username = $this->extractUsernameFromStorageId($fileRecord['storage_id_string']);
             if ($username === null) {
                 $this->logger->warning("S3ShadowMigrator: could not extract username from storage_id '{$fileRecord['storage_id_string']}'. Skipping.", ['app' => 's3shadowmigrator']);
+                if ($progressCallback !== null) {
+                    $progressCallback();
+                }
                 continue;
             }
 
             if ($this->migrateFileRecord($fileRecord, $username, $s3StorageId)) {
                 $succeeded++;
+            }
+            if ($progressCallback !== null) {
+                $progressCallback();
             }
         }
 
@@ -121,14 +127,17 @@ class S3MigrationService {
      * Joins oc_storages to get the storage string ID for username extraction.
      * Excludes directories, thumbnails, appdata, and partial uploads.
      */
-    private function getLocalFilesToMigrate(int $limit, int $s3StorageId): array {
+    public function getLocalFilesToMigrate(int $limit, int $s3StorageId, int $maxSizeBytes = 0): array {
         $query = $this->db->getQueryBuilder();
-        $query->select('fc.fileid', 'fc.path', 'fc.size', 'fc.storage', 's.id AS storage_id_string')
+        $query->select('fc.fileid', 'fc.path', 'fc.size', 'fc.storage', 'fc.etag', 's.id AS storage_id_string')
               ->from('filecache', 'fc')
               ->innerJoin('fc', 'storages', 's', $query->expr()->eq('fc.storage', 's.numeric_id'))
               ->innerJoin('fc', 'mimetypes', 'mt', $query->expr()->eq('fc.mimetype', 'mt.id'))
+              ->leftJoin('fc', 's3shadow_files', 'sf', $query->expr()->eq('fc.fileid', 'sf.fileid'))
               // Only local home storages
               ->where($query->expr()->like('s.id', $query->createNamedParameter('home::%')))
+              // EXCLUSION: Do not migrate files for user Jin Kim
+              ->andWhere($query->expr()->neq('s.id', $query->createNamedParameter('home::Jin Kim')))
               // Only actual files (not directories)
               ->andWhere($query->expr()->neq('mt.mimetype', $query->createNamedParameter('httpd/unix-directory')))
               // Only real user files, not thumbnails/cache
@@ -137,10 +146,23 @@ class S3MigrationService {
               ->andWhere($query->expr()->gt('fc.size', $query->createNamedParameter(0)))
               // Exclude partial/temp uploads
               ->andWhere($query->expr()->notLike('fc.path', $query->createNamedParameter('%.ocTransferId%')))
+              // COOLDOWN: Only migrate files older than 30 minutes to avoid race conditions with chunked uploads
+              ->andWhere($query->expr()->lt('fc.mtime', $query->createNamedParameter(time() - 1800)))
+              // EXCLUSION: Exclude files that are already sparse, UNLESS they were overwritten locally (ETag changed)
+              ->andWhere($query->expr()->orX(
+                  $query->expr()->isNull('sf.fileid'),
+                  $query->expr()->neq('fc.etag', 'sf.migrated_etag')
+              ))
               ->andWhere($query->expr()->notLike('fc.path', $query->createNamedParameter('%/.ocdata')))
               // Order by smallest files first for faster initial drain
-              ->orderBy('fc.size', 'ASC')
-              ->setMaxResults($limit);
+              ->orderBy('fc.size', 'ASC');
+
+        // Optional: only migrate files below a size threshold
+        if ($maxSizeBytes > 0) {
+            $query->andWhere($query->expr()->lte('fc.size', $query->createNamedParameter($maxSizeBytes)));
+        }
+
+        $query->setMaxResults($limit);
 
         return $query->executeQuery()->fetchAll();
     }
@@ -229,14 +251,18 @@ class S3MigrationService {
                 ]);
             }
 
-            // Update database pointer to S3 storage
-            $dbSuccess = $this->fileCacheUpdater->migrateFileRecord($fileId, $s3StorageId, $s3Key);
+            // Mark file as sparse in custom tracking table
+            $dbSuccess = $this->fileCacheUpdater->markFileAsSparse($fileId, $fileRecord['etag'], $s3Key);
 
             if ($dbSuccess) {
-                if (!unlink($localPhysicalPath)) {
-                    $this->logger->warning("S3ShadowMigrator: file ID {$fileId} uploaded and DB updated but local deletion failed: {$localPhysicalPath}", ['app' => 's3shadowmigrator']);
+                // Truncate the file to sparse instead of deleting it to preserve Nextcloud DB integrity
+                $f = fopen($localPhysicalPath, 'w');
+                if ($f) {
+                    ftruncate($f, $fileSize);
+                    fclose($f);
+                    $this->logger->info("S3ShadowMigrator: sparse truncated file ID {$fileId} (now 0 bytes on disk) → s3://{$bucketName}/{$s3Key}", ['app' => 's3shadowmigrator']);
                 } else {
-                    $this->logger->info("S3ShadowMigrator: migrated file ID {$fileId} → s3://{$bucketName}/{$s3Key}", ['app' => 's3shadowmigrator']);
+                    $this->logger->warning("S3ShadowMigrator: file ID {$fileId} uploaded and DB updated but sparse truncation failed: {$localPhysicalPath}", ['app' => 's3shadowmigrator']);
                 }
                 return true;
             } else {
@@ -279,7 +305,7 @@ class S3MigrationService {
     public function migrateFileById(int $fileId, int $s3StorageId): bool {
         // Fetch the specific file record
         $query = $this->db->getQueryBuilder();
-        $query->select('fc.fileid', 'fc.path', 'fc.size', 'fc.storage', 's.id AS storage_id_string')
+        $query->select('fc.fileid', 'fc.path', 'fc.size', 'fc.storage', 'fc.etag', 's.id AS storage_id_string')
               ->from('filecache', 'fc')
               ->innerJoin('fc', 'storages', 's', $query->expr()->eq('fc.storage', 's.numeric_id'))
               ->where($query->expr()->eq('fc.fileid', $query->createNamedParameter($fileId)));
