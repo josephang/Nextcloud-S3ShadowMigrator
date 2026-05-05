@@ -59,6 +59,11 @@ class Admin implements ISettings {
             'available_groups'    => $groups,
         ];
 
+        // Load admin settings JS as an external file — inline <script> tags in
+        // settings templates are silently dropped by browsers when Nextcloud
+        // injects the section HTML via innerHTML.
+        \OCP\Util::addScript('s3shadowmigrator', 'settings-admin');
+
         return new TemplateResponse('s3shadowmigrator', 'settings-admin', $parameters);
     }
 
