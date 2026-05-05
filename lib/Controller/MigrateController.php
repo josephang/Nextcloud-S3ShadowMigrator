@@ -67,7 +67,7 @@ class MigrateController extends Controller {
             return new DataResponse(['status' => 'success', 'message' => 'File is already on S3.']);
         }
 
-        $success = $this->migrationService->migrateFile($fileId, $fileRecord['path'], $fileRecord, $s3StorageId);
+        $success = $this->migrationService->migrateFileById($fileId, $s3StorageId);
 
         if ($success) {
             return new DataResponse(['status' => 'success']);

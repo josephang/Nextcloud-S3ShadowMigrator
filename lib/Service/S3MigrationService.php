@@ -14,6 +14,7 @@ use Psr\Log\LoggerInterface;
 use Aws\S3\S3Client;
 use Aws\S3\MultipartUploader;
 use Aws\S3\Exception\S3Exception;
+use Aws\Exception\MultipartUploadException;
 
 class S3MigrationService {
     private FileCacheUpdater $fileCacheUpdater;
@@ -23,8 +24,7 @@ class S3MigrationService {
     private LoggerInterface $logger;
     private ?S3Client $s3Client = null;
 
-    // BUG FIX: Files larger than this threshold use multipart upload (100 MB).
-    // putObject() silently fails or times out on large files.
+    // Files >= 100 MB use multipart upload
     private const MULTIPART_THRESHOLD_BYTES = 104857600;
 
     public function __construct(
@@ -48,9 +48,6 @@ class S3MigrationService {
             $key      = $this->config->getAppValue('s3shadowmigrator', 's3_key', '');
             $secret   = $this->config->getAppValue('s3shadowmigrator', 's3_secret', '');
 
-            // BUG FIX: Guard against empty credentials which causes the AWS SDK to hang
-            // trying to fetch instance metadata from EC2 IMDS endpoint (169.254.169.254)
-            // for up to 30 seconds before throwing a misleading error.
             if (empty($key) || empty($secret)) {
                 throw new \RuntimeException('S3 credentials are not configured in S3 Shadow Migrator settings.');
             }
@@ -74,171 +71,237 @@ class S3MigrationService {
         return $this->s3Client;
     }
 
-    public function migrateBatch(int $limit = 500): void {
+    /**
+     * Main batch entry point called by the cron job and CLI command.
+     * Drains local home storage files into the configured S3/B2 bucket.
+     */
+    public function migrateBatch(int $limit = 500): int {
         $s3BucketIdentifier = $this->config->getAppValue('s3shadowmigrator', 's3_bucket_identifier', '');
         if (empty($s3BucketIdentifier)) {
-            $this->logger->warning('Target S3 bucket identifier is not configured.', ['app' => 's3shadowmigrator']);
-            return;
+            $this->logger->warning('S3ShadowMigrator: target bucket identifier is not configured.', ['app' => 's3shadowmigrator']);
+            return 0;
         }
 
         $s3StorageId = $this->fileCacheUpdater->getS3StorageId($s3BucketIdentifier);
         if ($s3StorageId === null) {
-            $this->logger->error("Could not find storage ID for identifier: {$s3BucketIdentifier}", ['app' => 's3shadowmigrator']);
-            return;
+            $this->logger->error("S3ShadowMigrator: could not find storage numeric_id for '{$s3BucketIdentifier}'. Is the external storage mounted?", ['app' => 's3shadowmigrator']);
+            return 0;
         }
 
-        $filesToMigrate = $this->getFilesToMigrate($limit, $s3StorageId);
-        $this->logger->info('S3ShadowMigrator batch: found ' . count($filesToMigrate) . ' files to migrate.', ['app' => 's3shadowmigrator']);
+        $filesToMigrate = $this->getLocalFilesToMigrate($limit, $s3StorageId);
+        $count = count($filesToMigrate);
+
+        if ($count === 0) {
+            $this->logger->info('S3ShadowMigrator: no local files found to migrate. Drain is complete or nothing is configured.', ['app' => 's3shadowmigrator']);
+            return 0;
+        }
+
+        $this->logger->info("S3ShadowMigrator: starting batch of {$count} files.", ['app' => 's3shadowmigrator']);
+        $succeeded = 0;
 
         foreach ($filesToMigrate as $fileRecord) {
-            $this->migrateFile((int)$fileRecord['fileid'], $fileRecord['path'], $fileRecord, $s3StorageId);
+            // Extract username from storage ID string e.g. "home::josephang" → "josephang"
+            $username = $this->extractUsernameFromStorageId($fileRecord['storage_id_string']);
+            if ($username === null) {
+                $this->logger->warning("S3ShadowMigrator: could not extract username from storage_id '{$fileRecord['storage_id_string']}'. Skipping.", ['app' => 's3shadowmigrator']);
+                continue;
+            }
+
+            if ($this->migrateFileRecord($fileRecord, $username, $s3StorageId)) {
+                $succeeded++;
+            }
         }
+
+        $this->logger->info("S3ShadowMigrator: batch complete. {$succeeded}/{$count} files migrated.", ['app' => 's3shadowmigrator']);
+        return $succeeded;
     }
 
     /**
-     * Finds local files to migrate, excluding appdata, thumbnails, and directories.
+     * Finds files in local home:: storages only.
+     * Joins oc_storages to get the storage string ID for username extraction.
+     * Excludes directories, thumbnails, appdata, and partial uploads.
      */
-    private function getFilesToMigrate(int $limit, int $s3StorageId): array {
-        // BUG FIX: The old query used `mimetype = 2` to exclude folders, but oc_filecache stores
-        // a foreign key into oc_mimetypes, not a raw mimetype string. The integer 2 is NOT
-        // reliably the directory mimetype. The correct way to exclude directories is to
-        // filter on `mimepart != (SELECT id FROM oc_mimetypes WHERE mimetype = 'httpd/unix-directory')`.
-        // Simpler and more reliable: filter on size > 0 AND the path not ending in '/', which
-        // is how Nextcloud marks directories internally.
+    private function getLocalFilesToMigrate(int $limit, int $s3StorageId): array {
         $query = $this->db->getQueryBuilder();
-        $query->select('fc.*')
+        $query->select('fc.fileid', 'fc.path', 'fc.size', 'fc.storage', 's.id AS storage_id_string')
               ->from('filecache', 'fc')
-              ->where($query->expr()->neq('fc.storage', $query->createNamedParameter($s3StorageId)))
-              ->andWhere($query->expr()->gt('fc.size', $query->createNamedParameter(0)))
-              ->andWhere($query->expr()->notLike('fc.path', $query->createNamedParameter('appdata_%')))
-              ->andWhere($query->expr()->notLike('fc.path', $query->createNamedParameter('%.jpg.ocTransferId%'))) // skip partial uploads
-              ->andWhere($query->expr()->notLike('fc.path', $query->createNamedParameter('%/.ocdata')))
-              // BUG FIX: Exclude directories by filtering out paths that resolve to mimetype 'httpd/unix-directory'
+              ->innerJoin('fc', 'storages', 's', $query->expr()->eq('fc.storage', 's.numeric_id'))
               ->innerJoin('fc', 'mimetypes', 'mt', $query->expr()->eq('fc.mimetype', 'mt.id'))
+              // Only local home storages
+              ->where($query->expr()->like('s.id', $query->createNamedParameter('home::%')))
+              // Only actual files (not directories)
               ->andWhere($query->expr()->neq('mt.mimetype', $query->createNamedParameter('httpd/unix-directory')))
+              // Only real user files, not thumbnails/cache
+              ->andWhere($query->expr()->like('fc.path', $query->createNamedParameter('files/%')))
+              // Must have content
+              ->andWhere($query->expr()->gt('fc.size', $query->createNamedParameter(0)))
+              // Exclude partial/temp uploads
+              ->andWhere($query->expr()->notLike('fc.path', $query->createNamedParameter('%.ocTransferId%')))
+              ->andWhere($query->expr()->notLike('fc.path', $query->createNamedParameter('%/.ocdata')))
+              // Order by smallest files first for faster initial drain
+              ->orderBy('fc.size', 'ASC')
               ->setMaxResults($limit);
 
         return $query->executeQuery()->fetchAll();
     }
 
-    public function migrateFile(int $fileId, string $internalPath, array $fileRecord, int $s3StorageId): bool {
+    /**
+     * Extracts username from a home storage ID string.
+     * "home::josephang" → "josephang"
+     * "home::duck@origin600i.com" → "duck@origin600i.com"
+     */
+    private function extractUsernameFromStorageId(string $storageId): ?string {
+        if (!str_starts_with($storageId, 'home::')) {
+            return null;
+        }
+        $username = substr($storageId, strlen('home::'));
+        return !empty($username) ? $username : null;
+    }
+
+    /**
+     * Migrate a single file record from local home storage to S3.
+     * The S3 key structure is: <username>/<filecache_path>
+     * e.g. "josephang/files/Documents/report.pdf"
+     * This makes files accessible in Nextcloud at /originhangar/josephang/files/Documents/report.pdf
+     */
+    public function migrateFileRecord(array $fileRecord, string $username, int $s3StorageId): bool {
+        $fileId      = (int)$fileRecord['fileid'];
+        $cachePath   = $fileRecord['path']; // e.g. "files/Documents/report.pdf"
+
+        // Construct S3 key: username/files/Documents/report.pdf
+        $s3Key = $username . '/' . $cachePath;
+
+        // Construct physical local path
+        $dataDir = rtrim($this->config->getSystemValue('datadirectory', '/var/www/nextcloud/data'), '/');
+        $localPhysicalPath = $dataDir . '/' . $username . '/' . $cachePath;
+
+        if (!file_exists($localPhysicalPath)) {
+            $this->logger->debug("S3ShadowMigrator: file ID {$fileId} not found at expected path '{$localPhysicalPath}'. Skipping.", ['app' => 's3shadowmigrator']);
+            return false;
+        }
+
+        if (!is_readable($localPhysicalPath)) {
+            $this->logger->warning("S3ShadowMigrator: file ID {$fileId} is not readable at '{$localPhysicalPath}'. Skipping.", ['app' => 's3shadowmigrator']);
+            return false;
+        }
+
+        // Try to acquire an exclusive lock to prevent concurrent access
         $nodes = $this->rootFolder->getById($fileId);
-        if (empty($nodes)) {
-            $this->logger->debug("File ID {$fileId} not found in VFS.", ['app' => 's3shadowmigrator']);
-            return false;
-        }
+        $node = !empty($nodes) ? $nodes[0] : null;
+        $locked = false;
 
-        /** @var File $node */
-        $node = $nodes[0];
-
-        if (!($node instanceof File)) {
-            return false;
+        if ($node instanceof File) {
+            try {
+                $node->lock(ILockingProvider::LOCK_EXCLUSIVE);
+                $locked = true;
+            } catch (\OCP\Lock\LockedException $e) {
+                $this->logger->info("S3ShadowMigrator: file ID {$fileId} is locked (in use). Skipping.", ['app' => 's3shadowmigrator']);
+                return false;
+            }
         }
 
         try {
-            $node->lock(ILockingProvider::LOCK_EXCLUSIVE);
-        } catch (\OCP\Lock\LockedException $e) {
-            $this->logger->info("File ID {$fileId} is currently locked. Skipping migration.", ['app' => 's3shadowmigrator']);
-            return false;
-        }
-
-        $localPhysicalPath = null;
-        $s3Key = null;
-        $uploadedToS3 = false;
-
-        try {
-            // BUG FIX: The internal path from oc_filecache is RELATIVE to the storage root (e.g. "files/photo.jpg").
-            // The physical path requires the user's data directory prefix. We must resolve it via the Node API
-            // to handle all edge cases (including encrypted storage, mounted external storage, etc.)
-            $localPhysicalPath = $node->getStorage()->getLocalFile($node->getInternalPath());
-
-            if ($localPhysicalPath === null || !file_exists($localPhysicalPath)) {
-                $this->logger->info("File ID {$fileId}: local physical path not resolvable or missing. Skipping.", ['app' => 's3shadowmigrator']);
-                return false;
-            }
-
-            if (!is_writable($localPhysicalPath)) {
-                $this->logger->info("File ID {$fileId}: file is not writable, cannot safely delete after upload. Skipping.", ['app' => 's3shadowmigrator']);
-                return false;
-            }
-
-            $fileSize = filesize($localPhysicalPath);
-            // BUG FIX: md5_file on a very large file (multi-GB) can cause a PHP memory exhaustion.
-            // We only compute the hash for files below the multipart threshold.
-            $localHash = ($fileSize < self::MULTIPART_THRESHOLD_BYTES) ? md5_file($localPhysicalPath) : null;
-
+            $fileSize   = filesize($localPhysicalPath);
             $bucketName = $this->config->getAppValue('s3shadowmigrator', 's3_bucket_name', '');
+
             if (empty($bucketName)) {
-                $this->logger->error("S3 bucket name is not configured.", ['app' => 's3shadowmigrator']);
+                $this->logger->error('S3ShadowMigrator: bucket name is not configured.', ['app' => 's3shadowmigrator']);
                 return false;
             }
 
-            // Use the node's internal path as the S3 key (relative to its storage root)
-            $s3Key = $node->getInternalPath();
             $s3 = $this->getS3Client();
 
-            // BUG FIX: Use multipart upload for large files. putObject() will silently hang or
-            // timeout for files larger than ~100MB, leaving no error in the logs.
+            // Use multipart upload for large files
             if ($fileSize >= self::MULTIPART_THRESHOLD_BYTES) {
-                $this->logger->info("File ID {$fileId} is large ({$fileSize} bytes), using multipart upload.", ['app' => 's3shadowmigrator']);
+                $this->logger->info("S3ShadowMigrator: using multipart upload for file ID {$fileId} ({$fileSize} bytes).", ['app' => 's3shadowmigrator']);
                 $uploader = new MultipartUploader($s3, $localPhysicalPath, [
                     'bucket' => $bucketName,
                     'key'    => $s3Key,
                 ]);
                 $uploader->upload();
             } else {
-                $putParams = [
+                $localHash = md5_file($localPhysicalPath);
+                $s3->putObject([
                     'Bucket'     => $bucketName,
                     'Key'        => $s3Key,
                     'SourceFile' => $localPhysicalPath,
-                ];
-                if ($localHash !== null) {
-                    $putParams['ContentMD5'] = base64_encode(pack('H*', $localHash));
-                }
-                $s3->putObject($putParams);
+                    'ContentMD5' => base64_encode(pack('H*', $localHash)),
+                ]);
             }
 
-            $uploadedToS3 = true;
-
-            // Surgically update DB pointer in a transaction
+            // Update database pointer to S3 storage
             $dbSuccess = $this->fileCacheUpdater->migrateFileRecord($fileId, $s3StorageId, $s3Key);
 
             if ($dbSuccess) {
-                // BUG FIX: unlink() can silently fail on NFS/network mounts. We check the return value
-                // and log the failure. The DB is already updated, so we don't roll back - the file
-                // will just exist in both places (harmless duplicate, not a data loss scenario).
                 if (!unlink($localPhysicalPath)) {
-                    $this->logger->warning("File ID {$fileId}: uploaded to S3 and DB updated, but local file deletion failed. Manual cleanup required: {$localPhysicalPath}", ['app' => 's3shadowmigrator']);
+                    $this->logger->warning("S3ShadowMigrator: file ID {$fileId} uploaded and DB updated but local deletion failed: {$localPhysicalPath}", ['app' => 's3shadowmigrator']);
                 } else {
-                    $this->logger->info("Successfully migrated File ID {$fileId} to S3.", ['app' => 's3shadowmigrator']);
+                    $this->logger->info("S3ShadowMigrator: migrated file ID {$fileId} → s3://{$bucketName}/{$s3Key}", ['app' => 's3shadowmigrator']);
                 }
                 return true;
             } else {
-                // DB update failed (transaction rolled back). Delete orphaned S3 object.
-                $this->logger->error("File ID {$fileId}: DB update failed. Rolling back S3 upload.", ['app' => 's3shadowmigrator']);
-                $s3->deleteObject(['Bucket' => $bucketName, 'Key' => $s3Key]);
+                // DB failed — roll back S3 upload to prevent orphan objects
+                $this->logger->error("S3ShadowMigrator: DB update failed for file ID {$fileId}. Rolling back S3 object.", ['app' => 's3shadowmigrator']);
+                try {
+                    $s3->deleteObject(['Bucket' => $bucketName, 'Key' => $s3Key]);
+                } catch (\Exception $cleanupError) {
+                    $this->logger->warning("S3ShadowMigrator: failed to clean up orphaned S3 object '{$s3Key}': " . $cleanupError->getMessage(), ['app' => 's3shadowmigrator']);
+                }
                 return false;
             }
 
+        } catch (MultipartUploadException $e) {
+            $this->logger->error("S3ShadowMigrator: multipart upload failed for file ID {$fileId}: " . $e->getMessage(), ['app' => 's3shadowmigrator']);
+            return false;
         } catch (S3Exception $e) {
-            $this->logger->error("S3 Upload failed for File ID {$fileId}: " . $e->getMessage(), ['app' => 's3shadowmigrator']);
+            $this->logger->error("S3ShadowMigrator: S3 upload failed for file ID {$fileId}: " . $e->getMessage(), ['app' => 's3shadowmigrator']);
             return false;
         } catch (\Exception $e) {
-            $this->logger->error("Unexpected error migrating File ID {$fileId}: " . $e->getMessage(), [
+            $this->logger->error("S3ShadowMigrator: unexpected error for file ID {$fileId}: " . $e->getMessage(), [
                 'app'       => 's3shadowmigrator',
                 'exception' => $e,
             ]);
             return false;
         } finally {
-            // BUG FIX: The original code only unlocked in happy-path branches.
-            // If an exception was thrown, the file would remain EXCLUSIVELY locked forever,
-            // causing all subsequent access to that file to fail with LockedException.
-            // The lock MUST be released in a finally block.
-            try {
-                $node->unlock(ILockingProvider::LOCK_EXCLUSIVE);
-            } catch (\Exception $unlockError) {
-                $this->logger->warning("Failed to unlock File ID {$fileId}: " . $unlockError->getMessage(), ['app' => 's3shadowmigrator']);
+            if ($locked && $node instanceof File) {
+                try {
+                    $node->unlock(ILockingProvider::LOCK_EXCLUSIVE);
+                } catch (\Exception $e) {
+                    $this->logger->warning("S3ShadowMigrator: failed to unlock file ID {$fileId}.", ['app' => 's3shadowmigrator']);
+                }
             }
         }
+    }
+
+    /**
+     * Migrate a single specific file by ID. Used by CLI command and web controller.
+     */
+    public function migrateFileById(int $fileId, int $s3StorageId): bool {
+        // Fetch the specific file record
+        $query = $this->db->getQueryBuilder();
+        $query->select('fc.fileid', 'fc.path', 'fc.size', 'fc.storage', 's.id AS storage_id_string')
+              ->from('filecache', 'fc')
+              ->innerJoin('fc', 'storages', 's', $query->expr()->eq('fc.storage', 's.numeric_id'))
+              ->where($query->expr()->eq('fc.fileid', $query->createNamedParameter($fileId)));
+
+        $fileRecord = $query->executeQuery()->fetch();
+
+        if (!$fileRecord) {
+            $this->logger->error("S3ShadowMigrator: file ID {$fileId} not found in oc_filecache.", ['app' => 's3shadowmigrator']);
+            return false;
+        }
+
+        if ((int)$fileRecord['storage'] === $s3StorageId) {
+            $this->logger->info("S3ShadowMigrator: file ID {$fileId} is already on S3.", ['app' => 's3shadowmigrator']);
+            return true;
+        }
+
+        $username = $this->extractUsernameFromStorageId($fileRecord['storage_id_string']);
+        if ($username === null) {
+            $this->logger->error("S3ShadowMigrator: storage '{$fileRecord['storage_id_string']}' is not a local home storage. Cannot migrate.", ['app' => 's3shadowmigrator']);
+            return false;
+        }
+
+        return $this->migrateFileRecord($fileRecord, $username, $s3StorageId);
     }
 }

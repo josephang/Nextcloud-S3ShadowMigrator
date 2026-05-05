@@ -26,8 +26,8 @@ class ShadowMigrationJob extends TimedJob {
         $this->config = $config;
         $this->logger = $logger;
 
-        // Run this job periodically (e.g. every hour)
-        $this->setInterval(3600);
+        // Run every 15 minutes for aggressive drain. Nextcloud won't overlap cron runs.
+        $this->setInterval(900);
     }
 
     /**
@@ -46,7 +46,10 @@ class ShadowMigrationJob extends TimedJob {
         $this->logger->info("S3ShadowMigrator background job starting with batch limit of {$batchLimitFiles} files.", ['app' => 's3shadowmigrator']);
 
         try {
-            $this->migrationService->migrateBatch($batchLimitFiles);
+            $migrated = $this->migrationService->migrateBatch($batchLimitFiles);
+            if ($migrated > 0) {
+                $this->logger->info("S3ShadowMigrator cron: migrated {$migrated} files this run.", ['app' => 's3shadowmigrator']);
+            }
         } catch (\Exception $e) {
             $this->logger->error('Error during S3 shadow migration: ' . $e->getMessage(), [
                 'app' => 's3shadowmigrator',
