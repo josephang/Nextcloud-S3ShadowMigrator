@@ -9,24 +9,28 @@ use OCP\AppFramework\Http\DataResponse;
 use OCP\IRequest;
 use OCP\IConfig;
 use OCA\S3ShadowMigrator\Service\S3MigrationService;
+use OCA\S3ShadowMigrator\Service\SelfHealingService;
 use Psr\Log\LoggerInterface;
 
 class SettingsController extends Controller {
     private IConfig $config;
     private S3MigrationService $migrationService;
     private LoggerInterface $logger;
+    private SelfHealingService $healingService;
 
     public function __construct(
         string $AppName,
         IRequest $request,
         IConfig $config,
         S3MigrationService $migrationService,
-        LoggerInterface $logger
+        LoggerInterface $logger,
+        SelfHealingService $healingService
     ) {
         parent::__construct($AppName, $request);
         $this->config           = $config;
         $this->migrationService = $migrationService;
         $this->logger           = $logger;
+        $this->healingService   = $healingService;
     }
 
     /**
@@ -78,8 +82,9 @@ class SettingsController extends Controller {
         }
 
         try {
-            // Run a small synchronous batch (50 files) for immediate UI feedback
+            // Run a small synchronous batch for immediate UI feedback
             $migrated = $this->migrationService->migrateBatch(50);
+            $healed = $this->healingService->runAuditBatch();
 
             $cache = \OC::$server->getMemCacheFactory()->createDistributed('s3shadowmigrator');
             $log   = (string)$cache->get('live_log');
