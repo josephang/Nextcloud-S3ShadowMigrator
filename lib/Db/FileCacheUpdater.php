@@ -159,4 +159,48 @@ class FileCacheUpdater {
             return null;
         }
     }
+
+    /**
+     * Updates the status and healed_at columns on a tracked file record.
+     * Requires the DB migration Version1000000Date20260505000000 to have run.
+     *
+     * @param int    $fileId   The file cache ID
+     * @param string $status   'active' | 'lost' | 'corrupt' | 'orphan'
+     * @param string $healedAt ISO datetime of the healing action
+     */
+    public function updateFileStatus(int $fileId, string $status, string $healedAt): bool {
+        try {
+            $query = $this->db->getQueryBuilder();
+            $query->update('s3shadow_files')
+                  ->set('status',    $query->createNamedParameter($status))
+                  ->set('healed_at', $query->createNamedParameter($healedAt))
+                  ->where($query->expr()->eq('fileid', $query->createNamedParameter($fileId)));
+            $query->executeStatement();
+            return true;
+        } catch (\Exception $e) {
+            // Column may not exist yet if migration hasn't run — log warning, don't crash
+            $this->logger->warning('SelfHealer: updateFileStatus failed for ID ' . $fileId . ': ' . $e->getMessage(), ['app' => 's3shadowmigrator']);
+            return false;
+        }
+    }
+
+    /**
+     * Removes the sparse tracking row for a given file ID.
+     * Used for Corrupt-C (local intact, S3 missing → re-queue migration) and
+     * Orphan-DB (file deleted by user → stale DB row cleanup).
+     *
+     * @param int $fileId The file cache ID
+     */
+    public function removeSparseMark(int $fileId): bool {
+        try {
+            $query = $this->db->getQueryBuilder();
+            $query->delete('s3shadow_files')
+                  ->where($query->expr()->eq('fileid', $query->createNamedParameter($fileId)));
+            $query->executeStatement();
+            return true;
+        } catch (\Exception $e) {
+            $this->logger->error('SelfHealer: removeSparseMark failed for ID ' . $fileId . ': ' . $e->getMessage(), ['app' => 's3shadowmigrator']);
+            return false;
+        }
+    }
 }
