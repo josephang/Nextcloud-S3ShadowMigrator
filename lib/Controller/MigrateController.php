@@ -8,24 +8,28 @@ use OCP\AppFramework\Controller;
 use OCP\AppFramework\Http\DataResponse;
 use OCP\IRequest;
 use OCA\S3ShadowMigrator\Service\S3MigrationService;
-use OCP\Files\IRootFolder;
+use OCA\S3ShadowMigrator\Db\FileCacheUpdater;
+use OCP\IConfig;
 use OCP\IDBConnection;
 
 class MigrateController extends Controller {
     private S3MigrationService $migrationService;
-    private IRootFolder $rootFolder;
+    private FileCacheUpdater $fileCacheUpdater;
+    private IConfig $config;
     private IDBConnection $db;
 
     public function __construct(
         string $AppName,
         IRequest $request,
         S3MigrationService $migrationService,
-        IRootFolder $rootFolder,
+        FileCacheUpdater $fileCacheUpdater,
+        IConfig $config,
         IDBConnection $db
     ) {
         parent::__construct($AppName, $request);
         $this->migrationService = $migrationService;
-        $this->rootFolder = $rootFolder;
+        $this->fileCacheUpdater = $fileCacheUpdater;
+        $this->config = $config;
         $this->db = $db;
     }
 
@@ -33,7 +37,10 @@ class MigrateController extends Controller {
      * @NoAdminRequired
      */
     public function migrateFile(int $fileId): DataResponse {
-        // Need to fetch file record from DB to pass to migration service
+        if ($fileId <= 0) {
+            return new DataResponse(['status' => 'error', 'message' => 'Invalid file ID.'], 400);
+        }
+
         $query = $this->db->getQueryBuilder();
         $query->select('*')
               ->from('filecache')
@@ -45,24 +52,26 @@ class MigrateController extends Controller {
             return new DataResponse(['status' => 'error', 'message' => 'File not found in cache.'], 404);
         }
 
-        // Get target S3 storage ID
-        $s3BucketIdentifier = \OC::$server->getConfig()->getAppValue('s3shadowmigrator', 's3_bucket_identifier', '');
+        $s3BucketIdentifier = $this->config->getAppValue('s3shadowmigrator', 's3_bucket_identifier', '');
         if (empty($s3BucketIdentifier)) {
             return new DataResponse(['status' => 'error', 'message' => 'S3 Bucket identifier not configured.'], 500);
         }
 
-        $s3StorageId = \OC::$server->get( \OCA\S3ShadowMigrator\Db\FileCacheUpdater::class )->getS3StorageId($s3BucketIdentifier);
-
+        $s3StorageId = $this->fileCacheUpdater->getS3StorageId($s3BucketIdentifier);
         if ($s3StorageId === null) {
-            return new DataResponse(['status' => 'error', 'message' => 'S3 Storage ID not found.'], 500);
+            return new DataResponse(['status' => 'error', 'message' => 'S3 Storage not found in database. Is the external storage mounted?'], 500);
         }
 
-        $success = $this->migrationService->migrateFile($fileId, $fileRecord['path'], clone $fileRecord, $s3StorageId);
+        // BUG FIX: Check if already on S3 to avoid a pointless double-migration attempt
+        if ((int)$fileRecord['storage'] === $s3StorageId) {
+            return new DataResponse(['status' => 'success', 'message' => 'File is already on S3.']);
+        }
+
+        $success = $this->migrationService->migrateFile($fileId, $fileRecord['path'], $fileRecord, $s3StorageId);
 
         if ($success) {
             return new DataResponse(['status' => 'success']);
-        } else {
-            return new DataResponse(['status' => 'error', 'message' => 'Migration failed. File might be locked or already migrated.'], 400);
         }
+        return new DataResponse(['status' => 'error', 'message' => 'Migration failed. File may be locked or inaccessible. Check nextcloud.log.'], 400);
     }
 }

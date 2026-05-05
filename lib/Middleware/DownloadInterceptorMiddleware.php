@@ -6,10 +6,8 @@ namespace OCA\S3ShadowMigrator\Middleware;
 
 use OCP\Encryption\IManager as EncryptionManager;
 use OCP\IRequest;
-use OCP\Files\Node;
 use OCP\Files\File;
 use OCP\IConfig;
-use OCP\Db\QueryBuilder\IQueryBuilder;
 use OCP\IDBConnection;
 use Psr\Log\LoggerInterface;
 use Aws\S3\S3Client;
@@ -38,16 +36,21 @@ class DownloadInterceptorMiddleware {
 
     private function getS3Client(): S3Client {
         if ($this->s3Client === null) {
-            $region = $this->config->getAppValue('s3shadowmigrator', 's3_region', 'us-east-1');
+            $region   = $this->config->getAppValue('s3shadowmigrator', 's3_region', 'us-east-1');
             $endpoint = $this->config->getAppValue('s3shadowmigrator', 's3_endpoint', '');
-            $key = $this->config->getAppValue('s3shadowmigrator', 's3_key', '');
-            $secret = $this->config->getAppValue('s3shadowmigrator', 's3_secret', '');
+            $key      = $this->config->getAppValue('s3shadowmigrator', 's3_key', '');
+            $secret   = $this->config->getAppValue('s3shadowmigrator', 's3_secret', '');
+
+            // BUG FIX: Guard against empty credentials causing IMDS hang
+            if (empty($key) || empty($secret)) {
+                throw new \RuntimeException('S3 credentials are not configured in S3 Shadow Migrator settings.');
+            }
 
             $s3Config = [
-                'version' => 'latest',
-                'region'  => $region,
+                'version'                 => 'latest',
+                'region'                  => $region,
                 'use_path_style_endpoint' => true,
-                'credentials' => [
+                'credentials'             => [
                     'key'    => $key,
                     'secret' => $secret,
                 ],
@@ -63,76 +66,114 @@ class DownloadInterceptorMiddleware {
     }
 
     /**
-     * Intercept a download request. Returns true if redirect occurred and execution should stop.
+     * Intercept a download request. Issues a 302 pre-signed redirect if the file is on our S3 bucket.
      */
     public function interceptDownload(File $node): bool {
-        // 0. Only intercept GET requests on specific download routes to prevent breaking internal reads (thumbnails, syncs)
+        // BUG FIX: This is fired on BeforeNodeReadEvent which covers ALL file system operations,
+        // not just user-facing downloads. We must only redirect on actual HTTP requests.
+        // Nextcloud background jobs, preview generation, etc. run in CLI mode where
+        // PHP_SAPI is 'cli' or the request object has no URI. Redirecting in those contexts
+        // calls header() which is a no-op in CLI and then exit() which terminates the cron job.
+        if (PHP_SAPI === 'cli') {
+            return false;
+        }
+
+        // Only intercept GET requests
         if ($this->request->getMethod() !== 'GET') {
             return false;
         }
 
         $uri = $this->request->getRequestUri();
+
+        // BUG FIX: The original check for '/download' matched ANY URL containing the word download,
+        // including admin paths like '/settings/admin/download'. This must be anchored to known
+        // Nextcloud file download endpoint patterns only.
         $isDownloadRoute = (
-            strpos($uri, '/download') !== false || 
-            strpos($uri, '/remote.php/webdav') !== false || 
-            strpos($uri, '/remote.php/dav/files') !== false
+            preg_match('#/index\.php/f/\d+#', $uri) ||        // Web UI direct link
+            str_contains($uri, '/remote.php/webdav') ||        // WebDAV
+            str_contains($uri, '/remote.php/dav/files') ||     // DAV files
+            str_contains($uri, '/index.php/apps/files/ajax/download') || // Legacy AJAX download
+            (str_contains($uri, '/download') && str_contains($uri, '/apps/files')) // Files app download
         );
 
         if (!$isDownloadRoute) {
             return false;
         }
 
-        // 1. User Agent Check for older Desktop Sync Clients
-        $userAgent = $this->request->getHeader('User-Agent');
-        if (strpos((string)$userAgent, 'mirall') !== false || strpos((string)$userAgent, 'Nextcloud-') !== false) {
-            // "mirall" is the internal name for the ownCloud/Nextcloud desktop client
-            // Let the desktop client proxy through the server to avoid WebDAV 302 TLS panics
+        // Pass through for Desktop Sync Clients - they can panic on 302 redirects in WebDAV context
+        $userAgent = (string)$this->request->getHeader('User-Agent');
+        if (str_contains($userAgent, 'mirall') || str_contains($userAgent, 'Nextcloud-') || str_contains($userAgent, 'ownCloud-')) {
             $this->logger->debug('S3ShadowMigrator bypassing redirect for Desktop Client: ' . $userAgent, ['app' => 's3shadowmigrator']);
             return false;
         }
 
-        // 2. Encryption Check
+        // Bypass encrypted files - they MUST be decrypted server-side
         if ($this->encryptionManager->isReady()) {
-            $fileInfo = $node->getFileInfo();
-            if ($fileInfo->isEncrypted()) {
-                $this->logger->debug('S3ShadowMigrator bypassing redirect for encrypted file: ' . $node->getId(), ['app' => 's3shadowmigrator']);
+            // BUG FIX: getFileInfo() on a file throws if the storage is unavailable.
+            // The node itself has an isEncrypted() check path we can use more safely.
+            try {
+                if ($node->getFileInfo()->isEncrypted()) {
+                    $this->logger->debug('S3ShadowMigrator bypassing redirect for encrypted file ID: ' . $node->getId(), ['app' => 's3shadowmigrator']);
+                    return false;
+                }
+            } catch (\Exception $e) {
+                // If we can't determine encryption status, play it safe and don't redirect
                 return false;
             }
         }
 
-        // 3. Check if file is stored in our target S3 mount
+        // Check if this file is on our target S3 mount
         $s3BucketIdentifier = $this->config->getAppValue('s3shadowmigrator', 's3_bucket_identifier', '');
-        $fileStorageId = $node->getStorage()->getId();
-        
-        if ($fileStorageId !== $s3BucketIdentifier && !str_starts_with($fileStorageId, 's3::')) {
-             // Not an S3 stored file
-             return false;
+        if (empty($s3BucketIdentifier)) {
+            return false;
         }
 
-        // 4. Generate Pre-signed URL and Redirect
+        try {
+            $fileStorageId = $node->getStorage()->getId();
+        } catch (\Exception $e) {
+            $this->logger->debug('S3ShadowMigrator: could not get storage ID for file. Skipping.', ['app' => 's3shadowmigrator']);
+            return false;
+        }
+
+        // BUG FIX: The original check used str_starts_with($fileStorageId, 's3::') as a fallback,
+        // which would intercept ANY S3 external storage, not just ours. This could break
+        // downloads from other S3 mounts on the server. Match ONLY our configured identifier.
+        if ($fileStorageId !== $s3BucketIdentifier) {
+            return false;
+        }
+
+        // Generate Pre-signed URL and Redirect
         try {
             $s3 = $this->getS3Client();
             $bucketName = $this->config->getAppValue('s3shadowmigrator', 's3_bucket_name', '');
-            
-            // The internal path on the S3 bucket is the node's internal path
+
+            if (empty($bucketName)) {
+                $this->logger->warning('S3ShadowMigrator: bucket name not configured, cannot redirect.', ['app' => 's3shadowmigrator']);
+                return false;
+            }
+
             $s3Key = $node->getInternalPath();
-            
+
             $cmd = $s3->getCommand('GetObject', [
-                'Bucket' => $bucketName,
-                'Key'    => $s3Key
+                'Bucket'                     => $bucketName,
+                'Key'                        => $s3Key,
+                // BUG FIX: Without ResponseContentDisposition, the browser downloads the file
+                // without a proper filename (it uses the S3 key as the filename). Force the
+                // correct filename in the pre-signed URL itself.
+                'ResponseContentDisposition' => 'attachment; filename="' . basename($s3Key) . '"',
             ]);
-            
-            // Generate a pre-signed URL valid for 15 minutes
-            $request = $s3->createPresignedRequest($cmd, '+15 minutes');
-            $presignedUrl = (string)$request->getUri();
-            
-            $this->logger->info("S3ShadowMigrator issuing 302 Redirect for file: {$s3Key}", ['app' => 's3shadowmigrator']);
-            
-            // Issue HTTP 302 Redirect
+
+            // Pre-signed URL valid for 1 hour (enough for very large file downloads)
+            $presignedRequest = $s3->createPresignedRequest($cmd, '+1 hour');
+            $presignedUrl = (string)$presignedRequest->getUri();
+
+            $this->logger->info("S3ShadowMigrator: issuing 302 for file key: {$s3Key}", ['app' => 's3shadowmigrator']);
+
             header('Location: ' . $presignedUrl, true, 302);
-            exit(); // Terminate execution immediately to stop PHP from streaming the file
+            exit();
+
         } catch (\Exception $e) {
-            $this->logger->error('Failed to generate S3 pre-signed URL: ' . $e->getMessage(), ['app' => 's3shadowmigrator']);
+            $this->logger->error('S3ShadowMigrator: failed to generate pre-signed URL: ' . $e->getMessage(), ['app' => 's3shadowmigrator']);
             return false;
         }
     }
