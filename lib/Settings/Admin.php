@@ -31,7 +31,7 @@ class Admin implements ISettings {
     }
 
     public function getSection(): string {
-        return 's3shadowmigrator';
+        return 'additional';
     }
 
     public function getPriority(): int {

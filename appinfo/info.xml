@@ -26,6 +26,6 @@
 
     <settings>
         <admin>OCA\S3ShadowMigrator\Settings\Admin</admin>
-        <admin-section>OCA\S3ShadowMigrator\Settings\AdminSection</admin-section>
+
     </settings>
 </info>
