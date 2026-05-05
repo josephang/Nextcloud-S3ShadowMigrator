@@ -14,8 +14,12 @@ This app was built to bypass Nextcloud's native bandwidth bottlenecks and databa
    A low-level `S3ShadowStorageWrapper` hooks into Nextcloud's `\OC\Files\Storage\Local`. It detects internal Nextcloud background workers (like Preview Generators or Search Indexers) and actively blocks them from reading the 0-byte sparse files, preventing infinite streams of null bytes from crashing the server's memory.
 4. **Hybrid Vault Encryption**
    Any folder named `EncryptedVault` automatically triggers a streaming hardware-accelerated OpenSSL AES-256-CBC encryption pipeline. The Azure server encrypts the files on the fly before pushing them to Backblaze. When downloaded, the server automatically bypasses the 302 redirect and proxies the stream to securely decrypt it in real-time, delivering native selective Server-Side encryption without ruining Zero-Egress for the rest of the server!
-5. **Self-Healing Versioning**
-   The application tracks file ETags. If a user natively overwrites a file via Nextcloud, the ETag mismatch is instantly detected. The middleware falls back to serving the new local file, and the Migrator sweeps it back into S3 on its next pass.
+5. **Self-Healing System (v1.1.0+)**
+   An autonomous hourly background job audits all database-tracked files and scans the S3 bucket via paginated `ListObjectsV2`. It automatically detects and recovers from 5 specific corruption states (like locally overwritten sparse files, orphaned S3 objects, and 0-byte upload failures) without destroying data. Lost files are automatically flagged with `status='lost'` for administrative review.
+6. **Dynamic Bandwidth Throttling**
+   The migrator daemon includes a real-time micro-sleep engine that dynamically pauses between uploads to perfectly match your desired egress limit (e.g., 50MB/s Balanced, 10MB/s Gentle, or Custom values).
+7. **Redis Transparency Dashboard**
+   Live migration logs are piped directly into Nextcloud's `IMemcache` (Redis/APCu) allowing the Nextcloud Admin UI to stream the daemon's terminal output in real-time without file-locking clashes or excessive database writes.
 
 ---
 
@@ -71,15 +75,12 @@ sudo -u www-data php occ s3shadowmigrator:gc
 
 ---
 
-## Important Exclusions
+## Administrative UI & Inclusions/Exclusions
 
-You can manually exclude certain users or paths from the migration sweep by editing the query builder inside `lib/Service/S3MigrationService.php`.
-
-**Example:**
-```php
-// EXCLUSION: Do not migrate files for user Jin Kim
-->andWhere($query->expr()->neq('s.id', $query->createNamedParameter('home::Jin Kim')))
-```
+The migrator features a rich graphical interface in Nextcloud's Administrative settings:
+- **Exclusion/Inclusion Toggle:** Dynamically switch between **Blacklist Mode** (migrate everyone *except* the selected users/groups) or **Whitelist Mode** (migrate *only* the selected users/groups).
+- **Checklist UX:** Easily browse and select target Users and Groups from a scrollable checklist without having to edit complex configuration files.
+- **Real-Time Terminal:** Monitor the background daemon's live progress via the embedded Redis dashboard directly in your browser.
 
 ## Security & Encryption
 - **Hybrid Vault Encryption (NEW):** Create any folder named `EncryptedVault` and the S3 Migrator will natively encrypt its contents using an auto-generated AES-256 master key (stored in the Nextcloud database via `occ config:app:set s3shadowmigrator vault_key`). Files in this folder are encrypted at rest in S3 and seamlessly decrypted by the Azure server upon download.

@@ -12,6 +12,11 @@
         </label>
         <br/><br/>
 
+        <div style="background-color: #f8f9fa; border-left: 4px solid #0082c9; padding: 10px 15px; margin-bottom: 20px; font-size: 13px; color: #333; border-radius: 3px;">
+            <strong style="color: #0082c9;">Hybrid Vault Encryption</strong><br/>
+            Any folder named <code>EncryptedVault</code> will automatically trigger hardware-accelerated OpenSSL AES-256-CBC encryption during migration. Files are encrypted at rest in S3 and seamlessly decrypted on the fly when downloaded.
+        </div>
+
         <label for="s3sm-mount-id"><?php p($l->t('Target Amazon S3 Mount')); ?></label>
         <select id="s3sm-mount-id" name="s3_mount_id">
             <option value="0">-- Select Mount --</option>
