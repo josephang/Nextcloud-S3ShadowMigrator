@@ -12,7 +12,9 @@ This app was built to bypass Nextcloud's native bandwidth bottlenecks and databa
    A custom `DownloadInterceptorMiddleware` intercepts Nextcloud download requests (UI, Share Links, WebDAV). If the file is tracked as sparse, it seamlessly generates a 302 Redirect to an S3 Pre-signed URL, completely bypassing the Nextcloud server's egress bandwidth.
 3. **The Null-Byte Trap Prevention**
    A low-level `S3ShadowStorageWrapper` hooks into Nextcloud's `\OC\Files\Storage\Local`. It detects internal Nextcloud background workers (like Preview Generators or Search Indexers) and actively blocks them from reading the 0-byte sparse files, preventing infinite streams of null bytes from crashing the server's memory.
-4. **Self-Healing Versioning**
+4. **Hybrid Vault Encryption**
+   Any folder named `EncryptedVault` automatically triggers a streaming hardware-accelerated OpenSSL AES-256-CBC encryption pipeline. The Azure server encrypts the files on the fly before pushing them to Backblaze. When downloaded, the server automatically bypasses the 302 redirect and proxies the stream to securely decrypt it in real-time, delivering native selective Server-Side encryption without ruining Zero-Egress for the rest of the server!
+5. **Self-Healing Versioning**
    The application tracks file ETags. If a user natively overwrites a file via Nextcloud, the ETag mismatch is instantly detected. The middleware falls back to serving the new local file, and the Migrator sweeps it back into S3 on its next pass.
 
 ---
@@ -80,8 +82,9 @@ You can manually exclude certain users or paths from the migration sweep by edit
 ```
 
 ## Security & Encryption
-- **End-to-End Encryption (E2EE):** Fully supported. Users must use the Nextcloud Mobile/Desktop clients to encrypt their files locally. The encrypted blobs are seamlessly offloaded to S3.
-- **Server-Side Encryption (SSE):** Not Recommended. SSE requires Nextcloud to decrypt the file before sending it to the user, completely destroying the Zero-Egress direct streaming architecture.
+- **Hybrid Vault Encryption (NEW):** Create any folder named `EncryptedVault` and the S3 Migrator will natively encrypt its contents using an auto-generated AES-256 master key (stored in the Nextcloud database via `occ config:app:set s3shadowmigrator vault_key`). Files in this folder are encrypted at rest in S3 and seamlessly decrypted by the Azure server upon download.
+- **End-to-End Encryption (E2EE):** Fully supported. Users must use the Nextcloud Mobile/Desktop clients to encrypt their files locally. The encrypted blobs are seamlessly offloaded to S3 via the migrator.
+- **Standard Server-Side Encryption (SSE):** Not Recommended. Native Nextcloud SSE requires encrypting every file on the server, completely destroying the Zero-Egress direct streaming architecture. Use the Hybrid Vault feature instead.
 
 ---
 *Built for extreme scale.*
