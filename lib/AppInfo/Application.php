@@ -18,8 +18,7 @@ class Application extends App implements IBootstrap {
     }
 
     public function register(IRegistrationContext $context): void {
-        // Register the middleware
-        $context->registerMiddleware(DownloadInterceptorMiddleware::class);
+        // Not registered as AppFramework middleware, but used as a service in EventDispatcher
     }
 
     public function boot(IBootContext $context): void {

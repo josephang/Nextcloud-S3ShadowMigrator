@@ -71,7 +71,7 @@ class S3MigrationService {
             return;
         }
 
-        $filesToMigrate = $this->getFilesToMigrate($limit);
+        $filesToMigrate = $this->getFilesToMigrate($limit, $s3StorageId);
 
         foreach ($filesToMigrate as $fileRecord) {
             $this->migrateFile((int)$fileRecord['fileid'], $fileRecord['path'], clone $fileRecord, $s3StorageId);
@@ -81,11 +81,11 @@ class S3MigrationService {
     /**
      * Finds local files to migrate, excluding appdata thumbnails.
      */
-    private function getFilesToMigrate(int $limit): array {
+    private function getFilesToMigrate(int $limit, int $s3StorageId): array {
         $query = $this->db->getQueryBuilder();
         $query->select('*')
               ->from('filecache')
-              ->where($query->expr()->eq('storage', $query->createNamedParameter(1))) // 1 is usually local home storage. 
+              ->where($query->expr()->neq('storage', $query->createNamedParameter($s3StorageId))) // Anything not already on S3
               ->andWhere($query->expr()->notLike('path', $query->createNamedParameter('appdata_%/preview/%')))
               ->andWhere($query->expr()->notLike('path', $query->createNamedParameter('appdata_%/css/%')))
               ->andWhere($query->expr()->eq('mimetype', $query->createNamedParameter(2))) // Exclude folders (mimetype = 2 is file in some contexts, but let's query actual file type or just size > 0)
