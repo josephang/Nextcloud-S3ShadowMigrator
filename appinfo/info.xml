@@ -8,7 +8,7 @@
         Silently drains local storage to an S3-compatible object store and intercepts download requests
         with zero-bandwidth 302 Pre-signed URLs, rendering the Nextcloud host entirely stateless.
     </description>
-    <version>1.0.0</version>
+    <version>1.0.1</version>
     <licence>agpl</licence>
     <author>josephang</author>
 
