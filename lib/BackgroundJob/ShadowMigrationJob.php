@@ -26,8 +26,8 @@ class ShadowMigrationJob extends TimedJob {
         $this->config = $config;
         $this->logger = $logger;
 
-        // Run every 15 minutes for aggressive drain. Nextcloud won't overlap cron runs.
-        $this->setInterval(900);
+        // Set interval to run every 5 minutes (default for Nextcloud background jobs is often checked every 5 mins via system cron)
+        $this->setInterval(300);
     }
 
     /**
@@ -41,20 +41,32 @@ class ShadowMigrationJob extends TimedJob {
             return;
         }
 
-        $batchLimitFiles = (int)$this->config->getAppValue('s3shadowmigrator', 'batch_limit_files', '500');
-
-        $this->logger->info("S3ShadowMigrator background job starting with batch limit of {$batchLimitFiles} files.", ['app' => 's3shadowmigrator']);
-
-        try {
-            $migrated = $this->migrationService->migrateBatch($batchLimitFiles);
-            if ($migrated > 0) {
-                $this->logger->info("S3ShadowMigrator cron: migrated {$migrated} files this run.", ['app' => 's3shadowmigrator']);
+        $this->logger->info("S3ShadowMigrator continuous background daemon started.", ['app' => 's3shadowmigrator']);
+        
+        $startTime = microtime(true);
+        $totalMigrated = 0;
+        
+        // Loop continuously for exactly 4 minutes (240 seconds)
+        // This ensures maximum throughput without piling up Nextcloud's scheduler (which runs every 5 mins).
+        while (microtime(true) - $startTime < 240) {
+            try {
+                // Drain in chunks of 1000 files to keep memory usage low
+                $migrated = $this->migrationService->migrateBatch(1000);
+                $totalMigrated += $migrated;
+                
+                if ($migrated === 0) {
+                    // Drive is empty. Sleep for a few seconds to avoid spinning CPU until the 4 minutes are up
+                    sleep(10);
+                }
+            } catch (\Exception $e) {
+                $this->logger->error('Error during S3 shadow migration loop: ' . $e->getMessage(), [
+                    'app' => 's3shadowmigrator',
+                    'exception' => $e
+                ]);
+                break; // Exit loop on critical failure
             }
-        } catch (\Exception $e) {
-            $this->logger->error('Error during S3 shadow migration: ' . $e->getMessage(), [
-                'app' => 's3shadowmigrator',
-                'exception' => $e
-            ]);
         }
+        
+        $this->logger->info("S3ShadowMigrator continuous daemon gracefully exited. Total migrated this session: {$totalMigrated} files.", ['app' => 's3shadowmigrator']);
     }
 }

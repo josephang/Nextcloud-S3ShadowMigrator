@@ -7,24 +7,56 @@ namespace OCA\S3ShadowMigrator\Settings;
 use OCP\Settings\ISettings;
 use OCP\AppFramework\Http\TemplateResponse;
 use OCP\IConfig;
+use OCP\IDBConnection;
+use OCP\IUserManager;
+use OCP\IGroupManager;
 
 class Admin implements ISettings {
     private IConfig $config;
+    private IDBConnection $db;
+    private IUserManager $userManager;
+    private IGroupManager $groupManager;
 
-    public function __construct(IConfig $config) {
+    public function __construct(
+        IConfig $config,
+        IDBConnection $db,
+        IUserManager $userManager,
+        IGroupManager $groupManager
+    ) {
         $this->config = $config;
+        $this->db = $db;
+        $this->userManager = $userManager;
+        $this->groupManager = $groupManager;
     }
 
     public function getForm() {
+        // Fetch S3 Mounts
+        $query = $this->db->getQueryBuilder();
+        $query->select('mount_id', 'mount_point')
+              ->from('external_mounts')
+              ->where($query->expr()->eq('storage_backend', $query->createNamedParameter('amazons3')));
+        $mounts = $query->executeQuery()->fetchAll();
+
+        // Fetch Users and Groups
+        $users = [];
+        foreach ($this->userManager->search('') as $user) {
+            $users[] = $user->getUID();
+        }
+        $groups = [];
+        foreach ($this->groupManager->search('') as $group) {
+            $groups[] = $group->getGID();
+        }
+
         $parameters = [
             'auto_upload_enabled' => $this->config->getAppValue('s3shadowmigrator', 'auto_upload_enabled', 'no'),
-            'batch_limit_files' => $this->config->getAppValue('s3shadowmigrator', 'batch_limit_files', '500'),
-            's3_bucket_identifier' => $this->config->getAppValue('s3shadowmigrator', 's3_bucket_identifier', ''),
-            's3_bucket_name' => $this->config->getAppValue('s3shadowmigrator', 's3_bucket_name', ''),
-            's3_region' => $this->config->getAppValue('s3shadowmigrator', 's3_region', 'us-east-1'),
-            's3_endpoint' => $this->config->getAppValue('s3shadowmigrator', 's3_endpoint', ''),
-            's3_key' => $this->config->getAppValue('s3shadowmigrator', 's3_key', ''),
-            's3_secret' => $this->config->getAppValue('s3shadowmigrator', 's3_secret', ''),
+            's3_mount_id'         => $this->config->getAppValue('s3shadowmigrator', 's3_mount_id', '0'),
+            'throttle_mode'       => $this->config->getAppValue('s3shadowmigrator', 'throttle_mode', 'unlimited'),
+            'custom_throttle_mb'  => $this->config->getAppValue('s3shadowmigrator', 'custom_throttle_mb', '50'),
+            'exclusion_mode'      => $this->config->getAppValue('s3shadowmigrator', 'exclusion_mode', 'blacklist'),
+            'excluded_users'      => $this->config->getAppValue('s3shadowmigrator', 'excluded_users', ''),
+            'available_mounts'    => $mounts,
+            'available_users'     => $users,
+            'available_groups'    => $groups,
         ];
 
         return new TemplateResponse('s3shadowmigrator', 'settings-admin', $parameters);

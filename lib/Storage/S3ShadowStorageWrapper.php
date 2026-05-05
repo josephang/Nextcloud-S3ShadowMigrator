@@ -15,12 +15,14 @@ class S3ShadowStorageWrapper extends Wrapper {
     private ?FileCacheUpdater $fileCacheUpdater = null;
     private LoggerInterface $logger;
     private IConfig $config;
+    private IDBConnection $db;
     private ?S3Client $s3Client = null;
 
     public function __construct($parameters) {
         parent::__construct($parameters);
         $this->logger = \OC::$server->get(LoggerInterface::class);
         $this->config = \OC::$server->get(IConfig::class);
+        $this->db     = \OC::$server->get(IDBConnection::class);
     }
 
     private function getFileCacheUpdater(): FileCacheUpdater {
@@ -33,26 +35,8 @@ class S3ShadowStorageWrapper extends Wrapper {
 
     private function getS3Client(): S3Client {
         if ($this->s3Client === null) {
-            $region   = $this->config->getAppValue('s3shadowmigrator', 's3_region', 'us-east-1');
-            $endpoint = $this->config->getAppValue('s3shadowmigrator', 's3_endpoint', '');
-            $key      = $this->config->getAppValue('s3shadowmigrator', 's3_key', '');
-            $secret   = $this->config->getAppValue('s3shadowmigrator', 's3_secret', '');
-
-            $s3Config = [
-                'version'                 => 'latest',
-                'region'                  => $region,
-                'use_path_style_endpoint' => true,
-                'credentials'             => [
-                    'key'    => $key,
-                    'secret' => $secret,
-                ],
-            ];
-
-            if (!empty($endpoint)) {
-                $s3Config['endpoint'] = $endpoint;
-            }
-
-            $this->s3Client = new S3Client($s3Config);
+            $s3Config = \OCA\S3ShadowMigrator\Service\S3ConfigHelper::getS3Config($this->config, $this->db);
+            $this->s3Client = \OCA\S3ShadowMigrator\Service\S3ConfigHelper::createS3Client($s3Config);
             $this->s3Client->registerStreamWrapper();
         }
         return $this->s3Client;
@@ -103,7 +87,8 @@ class S3ShadowStorageWrapper extends Wrapper {
                 return false;
             }
 
-            $bucketName = $this->config->getAppValue('s3shadowmigrator', 's3_bucket_name', '');
+            $s3Config = \OCA\S3ShadowMigrator\Service\S3ConfigHelper::getS3Config($this->config, $this->db);
+            $bucketName = $s3Config['bucket'];
             $s3Key = $username . '/' . ltrim($path, '/');
             
             // Ensure S3 client and stream wrapper are registered

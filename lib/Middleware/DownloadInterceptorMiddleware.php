@@ -36,31 +36,8 @@ class DownloadInterceptorMiddleware {
 
     private function getS3Client(): S3Client {
         if ($this->s3Client === null) {
-            $region   = $this->config->getAppValue('s3shadowmigrator', 's3_region', 'us-east-1');
-            $endpoint = $this->config->getAppValue('s3shadowmigrator', 's3_endpoint', '');
-            $key      = $this->config->getAppValue('s3shadowmigrator', 's3_key', '');
-            $secret   = $this->config->getAppValue('s3shadowmigrator', 's3_secret', '');
-
-            // BUG FIX: Guard against empty credentials causing IMDS hang
-            if (empty($key) || empty($secret)) {
-                throw new \RuntimeException('S3 credentials are not configured in S3 Shadow Migrator settings.');
-            }
-
-            $s3Config = [
-                'version'                 => 'latest',
-                'region'                  => $region,
-                'use_path_style_endpoint' => true,
-                'credentials'             => [
-                    'key'    => $key,
-                    'secret' => $secret,
-                ],
-            ];
-
-            if (!empty($endpoint)) {
-                $s3Config['endpoint'] = $endpoint;
-            }
-
-            $this->s3Client = new S3Client($s3Config);
+            $s3Config = \OCA\S3ShadowMigrator\Service\S3ConfigHelper::getS3Config($this->config, $this->db);
+            $this->s3Client = \OCA\S3ShadowMigrator\Service\S3ConfigHelper::createS3Client($s3Config);
         }
         return $this->s3Client;
     }
@@ -151,13 +128,9 @@ class DownloadInterceptorMiddleware {
 
         // Generate Pre-signed URL and Redirect
         try {
+            $s3Config = \OCA\S3ShadowMigrator\Service\S3ConfigHelper::getS3Config($this->config, $this->db);
             $s3 = $this->getS3Client();
-            $bucketName = $this->config->getAppValue('s3shadowmigrator', 's3_bucket_name', '');
-
-            if (empty($bucketName)) {
-                $this->logger->warning('S3ShadowMigrator: bucket name not configured, cannot redirect.', ['app' => 's3shadowmigrator']);
-                return false;
-            }
+            $bucketName = $s3Config['bucket'];
 
             // Construct the expected S3 key: username/files/path...
             $s3Key = $username . '/' . ltrim($node->getInternalPath(), '/');

@@ -41,34 +41,36 @@ class S3MigrationService {
         $this->logger = $logger;
     }
 
+    private function writeLiveLog(string $message): void {
+        $timestamp = date('Y-m-d H:i:s');
+        // Use createDistributed() so the CLI cron job and PHP-FPM web process share the same key
+        $cache = \OC::$server->getMemCacheFactory()->createDistributed('s3shadowmigrator');
+        
+        $currentLog = (string)$cache->get('live_log');
+        if (strlen($currentLog) > 4000) {
+            $currentLog = substr($currentLog, -2000);
+            // Ensure we don't start midway through a line
+            $newlinePos = strpos($currentLog, "\n");
+            if ($newlinePos !== false) {
+                $currentLog = substr($currentLog, $newlinePos + 1);
+            }
+        }
+        
+        $newLog = $currentLog . "[{$timestamp}] {$message}\n";
+        $cache->set('live_log', $newLog, 3600);
+    }
+
     private function getS3Client(): S3Client {
         if ($this->s3Client === null) {
-            $region   = $this->config->getAppValue('s3shadowmigrator', 's3_region', 'us-east-1');
-            $endpoint = $this->config->getAppValue('s3shadowmigrator', 's3_endpoint', '');
-            $key      = $this->config->getAppValue('s3shadowmigrator', 's3_key', '');
-            $secret   = $this->config->getAppValue('s3shadowmigrator', 's3_secret', '');
-
-            if (empty($key) || empty($secret)) {
-                throw new \RuntimeException('S3 credentials are not configured in S3 Shadow Migrator settings.');
-            }
-
-            $s3Config = [
-                'version'                 => 'latest',
-                'region'                  => $region,
-                'use_path_style_endpoint' => true,
-                'credentials'             => [
-                    'key'    => $key,
-                    'secret' => $secret,
-                ],
-            ];
-
-            if (!empty($endpoint)) {
-                $s3Config['endpoint'] = $endpoint;
-            }
-
-            $this->s3Client = new S3Client($s3Config);
+            $s3Config = S3ConfigHelper::getS3Config($this->config, $this->db);
+            $this->s3Client = S3ConfigHelper::createS3Client($s3Config);
         }
         return $this->s3Client;
+    }
+
+    private function getBucketName(): string {
+        $s3Config = S3ConfigHelper::getS3Config($this->config, $this->db);
+        return $s3Config['bucket'];
     }
 
     /**
@@ -76,27 +78,25 @@ class S3MigrationService {
      * Drains local home storage files into the configured S3/B2 bucket.
      */
     public function migrateBatch(int $limit = 500, int $maxSizeBytes = 0, ?callable $progressCallback = null): int {
-        $s3BucketIdentifier = $this->config->getAppValue('s3shadowmigrator', 's3_bucket_identifier', '');
-        if (empty($s3BucketIdentifier)) {
-            $this->logger->warning('S3ShadowMigrator: target bucket identifier is not configured.', ['app' => 's3shadowmigrator']);
+        $s3MountId = $this->config->getAppValue('s3shadowmigrator', 's3_mount_id', '0');
+        if ($s3MountId === '0') {
+            $this->logger->warning('S3ShadowMigrator: S3 Mount ID not configured. Skipping migration.', ['app' => 's3shadowmigrator']);
+            $this->writeLiveLog('ERROR: S3 Mount ID not configured. Skipping migration.');
             return 0;
         }
 
-        $s3StorageId = $this->fileCacheUpdater->getS3StorageId($s3BucketIdentifier);
-        if ($s3StorageId === null) {
-            $this->logger->error("S3ShadowMigrator: could not find storage numeric_id for '{$s3BucketIdentifier}'. Is the external storage mounted?", ['app' => 's3shadowmigrator']);
-            return 0;
-        }
-
-        $filesToMigrate = $this->getLocalFilesToMigrate($limit, $s3StorageId, $maxSizeBytes);
+        $this->writeLiveLog("Starting database sweep for {$limit} files...");
+        $filesToMigrate = $this->getLocalFilesToMigrate($limit, $maxSizeBytes);
         $count = count($filesToMigrate);
 
         if ($count === 0) {
             $this->logger->info('S3ShadowMigrator: no local files found to migrate. Drain is complete or nothing is configured.', ['app' => 's3shadowmigrator']);
+            $this->writeLiveLog("SUCCESS: No local files found to migrate. Drive is empty.");
             return 0;
         }
 
         $this->logger->info("S3ShadowMigrator: starting batch of {$count} files.", ['app' => 's3shadowmigrator']);
+        $this->writeLiveLog("Found {$count} files. Starting upload...");
         $succeeded = 0;
 
         foreach ($filesToMigrate as $fileRecord) {
@@ -110,7 +110,7 @@ class S3MigrationService {
                 continue;
             }
 
-            if ($this->migrateFileRecord($fileRecord, $username, $s3StorageId)) {
+            if ($this->migrateFileRecord($fileRecord, $username)) {
                 $succeeded++;
             }
             if ($progressCallback !== null) {
@@ -119,6 +119,7 @@ class S3MigrationService {
         }
 
         $this->logger->info("S3ShadowMigrator: batch complete. {$succeeded}/{$count} files migrated.", ['app' => 's3shadowmigrator']);
+        $this->writeLiveLog("Batch complete. Successfully migrated {$succeeded}/{$count} files.");
         return $succeeded;
     }
 
@@ -127,7 +128,7 @@ class S3MigrationService {
      * Joins oc_storages to get the storage string ID for username extraction.
      * Excludes directories, thumbnails, appdata, and partial uploads.
      */
-    public function getLocalFilesToMigrate(int $limit, int $s3StorageId, int $maxSizeBytes = 0): array {
+    public function getLocalFilesToMigrate(int $limit, int $maxSizeBytes = 0): array {
         $query = $this->db->getQueryBuilder();
         $query->select('fc.fileid', 'fc.path', 'fc.size', 'fc.storage', 'fc.etag', 's.id AS storage_id_string')
               ->from('filecache', 'fc')
@@ -135,11 +136,57 @@ class S3MigrationService {
               ->innerJoin('fc', 'mimetypes', 'mt', $query->expr()->eq('fc.mimetype', 'mt.id'))
               ->leftJoin('fc', 's3shadow_files', 'sf', $query->expr()->eq('fc.fileid', 'sf.fileid'))
               // Only local home storages
-              ->where($query->expr()->like('s.id', $query->createNamedParameter('home::%')))
-              // EXCLUSION: Do not migrate files for user Jin Kim
-              ->andWhere($query->expr()->neq('s.id', $query->createNamedParameter('home::Jin Kim')))
-              // Only actual files (not directories)
-              ->andWhere($query->expr()->neq('mt.mimetype', $query->createNamedParameter('httpd/unix-directory')))
+              ->where($query->expr()->like('s.id', $query->createNamedParameter('home::%')));
+                     // EXCLUSION / INCLUSION LOGIC
+        $exclusionMode = $this->config->getAppValue('s3shadowmigrator', 'exclusion_mode', 'blacklist');
+        $excludedUsersStr = $this->config->getAppValue('s3shadowmigrator', 'excluded_users', '');
+        
+        $targetUsernames = [];
+        if (!empty($excludedUsersStr)) {
+            $items = array_map('trim', explode(',', $excludedUsersStr));
+            $explicitUsers = [];
+            $groups = [];
+            
+            foreach ($items as $item) {
+                if (str_starts_with($item, 'user::')) {
+                    $explicitUsers[] = substr($item, 6);
+                } elseif (str_starts_with($item, 'group::')) {
+                    $groups[] = substr($item, 7);
+                }
+            }
+            
+            $targetUsernames = $explicitUsers;
+            
+            if (!empty($groups)) {
+                $groupQuery = $this->db->getQueryBuilder();
+                $groupQuery->select('uid')
+                           ->from('group_user')
+                           ->where($groupQuery->expr()->in('gid', $groupQuery->createNamedParameter($groups, \OCP\DB\QueryBuilder\IQueryBuilder::PARAM_STR_ARRAY)));
+                // fetchAll() with associative array, then extract column
+                $groupUsersRows = $groupQuery->executeQuery()->fetchAll();
+                $groupUsers = array_map(function($row) { return $row['uid']; }, $groupUsersRows);
+                
+                if (!empty($groupUsers)) {
+                    $targetUsernames = array_merge($targetUsernames, $groupUsers);
+                }
+            }
+            
+            $targetUsernames = array_unique($targetUsernames);
+        }
+
+        if (!empty($targetUsernames)) {
+            $storageIds = array_map(function($u) { return 'home::' . $u; }, $targetUsernames);
+            if ($exclusionMode === 'whitelist') {
+                $query->andWhere($query->expr()->in('s.id', $query->createNamedParameter($storageIds, \OCP\DB\QueryBuilder\IQueryBuilder::PARAM_STR_ARRAY)));
+            } else {
+                $query->andWhere($query->expr()->notIn('s.id', $query->createNamedParameter($storageIds, \OCP\DB\QueryBuilder\IQueryBuilder::PARAM_STR_ARRAY)));
+            }
+        } elseif ($exclusionMode === 'whitelist') {
+            // Whitelist is empty: migrate no one. Use a dummy impossible condition.
+            $query->andWhere($query->expr()->eq('1', $query->createNamedParameter('0')));
+        }
+        
+        $query->andWhere($query->expr()->neq('mt.mimetype', $query->createNamedParameter('httpd/unix-directory')))
               // Only real user files, not thumbnails/cache
               ->andWhere($query->expr()->like('fc.path', $query->createNamedParameter('files/%')))
               // Must have content
@@ -186,7 +233,7 @@ class S3MigrationService {
      * e.g. "josephang/files/Documents/report.pdf"
      * This makes files accessible in Nextcloud at /originhangar/josephang/files/Documents/report.pdf
      */
-    public function migrateFileRecord(array $fileRecord, string $username, int $s3StorageId): bool {
+    public function migrateFileRecord(array $fileRecord, string $username): bool {
         $fileId      = (int)$fileRecord['fileid'];
         $cachePath   = $fileRecord['path']; // e.g. "files/Documents/report.pdf"
 
@@ -257,15 +304,12 @@ class S3MigrationService {
             $sourceFile = $tempVaultFile;
         }
 
+        // Throttle Logic Pre-computation
+        $startTime = microtime(true);
+
         try {
             $sourceFileSize = filesize($sourceFile);
-            $bucketName = $this->config->getAppValue('s3shadowmigrator', 's3_bucket_name', '');
-
-            if (empty($bucketName)) {
-                $this->logger->error('S3ShadowMigrator: bucket name is not configured.', ['app' => 's3shadowmigrator']);
-                if ($tempVaultFile) unlink($tempVaultFile);
-                return false;
-            }
+            $bucketName = $this->getBucketName();
 
             $s3 = $this->getS3Client();
 
@@ -290,20 +334,10 @@ class S3MigrationService {
             // Mark file as sparse in custom tracking table
             $dbSuccess = $this->fileCacheUpdater->markFileAsSparse($fileId, $fileRecord['etag'], $s3Key, $isVault);
 
-            if ($dbSuccess) {
-                // Truncate the original file to sparse instead of deleting it
-                $f = fopen($localPhysicalPath, 'w');
-                if ($f) {
-                    ftruncate($f, (int)$fileRecord['size']);
-                    fclose($f);
-                    $this->logger->info("S3ShadowMigrator: sparse truncated file ID {$fileId} (now 0 bytes on disk) → s3://{$bucketName}/{$s3Key}", ['app' => 's3shadowmigrator']);
-                } else {
-                    $this->logger->warning("S3ShadowMigrator: file ID {$fileId} uploaded and DB updated but sparse truncation failed: {$localPhysicalPath}", ['app' => 's3shadowmigrator']);
-                }
-                return true;
-            } else {
+            if (!$dbSuccess) {
                 // DB failed — roll back S3 upload to prevent orphan objects
                 $this->logger->error("S3ShadowMigrator: DB update failed for file ID {$fileId}. Rolling back S3 object.", ['app' => 's3shadowmigrator']);
+                $this->writeLiveLog("✗ DB Error: rolling back S3 object for file ID {$fileId}");
                 try {
                     $s3->deleteObject(['Bucket' => $bucketName, 'Key' => $s3Key]);
                 } catch (\Exception $cleanupError) {
@@ -312,17 +346,59 @@ class S3MigrationService {
                 return false;
             }
 
+            // --- Throttling Logic (runs AFTER upload, computed against actual elapsed time) ---
+            $throttleMode = $this->config->getAppValue('s3shadowmigrator', 'throttle_mode', 'unlimited');
+            $mbps = 0.0;
+            if ($throttleMode === 'balanced') {
+                $mbps = 50.0;
+            } elseif ($throttleMode === 'gentle') {
+                $mbps = 10.0;
+            } elseif ($throttleMode === 'custom') {
+                $customMb = (float)$this->config->getAppValue('s3shadowmigrator', 'custom_throttle_mb', '50');
+                $mbps = max(0.1, $customMb); // Prevent division by zero
+            }
+
+            if ($mbps > 0) {
+                $expectedSeconds = ($sourceFileSize / 1024 / 1024) / $mbps;
+                $actualSeconds = microtime(true) - $startTime;
+                if ($actualSeconds < $expectedSeconds) {
+                    $sleepMicro = (int)(($expectedSeconds - $actualSeconds) * 1000000);
+                    usleep($sleepMicro);
+                }
+            }
+            // ---------------------------------------------------------------------------------
+
+            // Truncate local file to 0 bytes (true sparse: no disk content, metadata preserved)
+            $f = fopen($localPhysicalPath, 'w');
+            if ($f) {
+                ftruncate($f, 0);
+                fclose($f);
+            } else {
+                $this->logger->warning("S3ShadowMigrator: uploaded and DB-marked file ID {$fileId} but sparse truncation failed: {$localPhysicalPath}", ['app' => 's3shadowmigrator']);
+            }
+
+            $humanSize = $sourceFileSize >= 1048576
+                ? round($sourceFileSize / 1048576, 2) . ' MB'
+                : round($sourceFileSize / 1024, 1) . ' KB';
+            $this->writeLiveLog("✓ [{$humanSize}] → {$s3Key}");
+            $this->logger->info("S3ShadowMigrator: sparse-migrated file ID {$fileId} ({$humanSize}) → s3://{$bucketName}/{$s3Key}", ['app' => 's3shadowmigrator']);
+
+            return true;
+
         } catch (MultipartUploadException $e) {
             $this->logger->error("S3ShadowMigrator: multipart upload failed for file ID {$fileId}: " . $e->getMessage(), ['app' => 's3shadowmigrator']);
+            $this->writeLiveLog("✗ Multipart Error for ID {$fileId}: " . $e->getMessage());
             return false;
         } catch (S3Exception $e) {
             $this->logger->error("S3ShadowMigrator: S3 upload failed for file ID {$fileId}: " . $e->getMessage(), ['app' => 's3shadowmigrator']);
+            $this->writeLiveLog("✗ S3 Error for ID {$fileId}: " . $e->getAwsErrorCode());
             return false;
         } catch (\Exception $e) {
             $this->logger->error("S3ShadowMigrator: unexpected error for file ID {$fileId}: " . $e->getMessage(), [
                 'app'       => 's3shadowmigrator',
                 'exception' => $e,
             ]);
+            $this->writeLiveLog("✗ Error for ID {$fileId}: " . $e->getMessage());
             return false;
         } finally {
             if ($tempVaultFile && file_exists($tempVaultFile)) {
@@ -356,9 +432,9 @@ class S3MigrationService {
             return false;
         }
 
-        if ((int)$fileRecord['storage'] === $s3StorageId) {
-            $this->logger->info("S3ShadowMigrator: file ID {$fileId} is already on S3.", ['app' => 's3shadowmigrator']);
-            return true;
+        if (!str_starts_with($fileRecord['storage_id_string'], 'home::')) {
+            $this->logger->info("S3ShadowMigrator: file ID {$fileId} is not a local file. Skipping.", ['app' => 's3shadowmigrator']);
+            return false;
         }
 
         $username = $this->extractUsernameFromStorageId($fileRecord['storage_id_string']);
@@ -367,6 +443,6 @@ class S3MigrationService {
             return false;
         }
 
-        return $this->migrateFileRecord($fileRecord, $username, $s3StorageId);
+        return $this->migrateFileRecord($fileRecord, $username);
     }
 }
