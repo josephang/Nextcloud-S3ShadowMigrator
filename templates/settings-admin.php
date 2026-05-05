@@ -72,6 +72,19 @@
                 </label>
             <?php endforeach; ?>
         </div>
+        <!-- Mirror Paths -->
+        <label style="font-weight:500;"><?php p($l->t('Mirror Paths (Keep Local)')); ?></label>
+        <p style="font-size:12px; color:var(--color-text-lighter); margin-top:2px; margin-bottom:8px;">
+            Paths that match these strings will be uploaded to S3 but <strong>will not</strong> be truncated locally (e.g. <code>Notes/</code>).
+        </p>
+        <div style="display:flex; gap:8px; margin-bottom:8px;">
+            <input type="text" id="s3sm-mirror-input" placeholder="e.g. Notes/" style="width:200px;" />
+            <button id="s3sm-add-mirror-btn" type="button" class="button" style="margin:0;">+ Add</button>
+        </div>
+        <div id="s3sm-mirror-grid" style="display:flex; flex-wrap:wrap; gap:8px; max-width:400px; margin-bottom:16px;">
+            <!-- Chips injected by JS -->
+        </div>
+        <input type="hidden" id="s3sm-mirror-paths" name="mirror_paths" value="<?php p($_['mirror_paths']); ?>" />
         <br/>
 
         <!-- Throttle -->

@@ -54,6 +54,7 @@ class Admin implements ISettings {
             'custom_throttle_mb'  => $this->config->getAppValue('s3shadowmigrator', 'custom_throttle_mb', '50'),
             'exclusion_mode'      => $this->config->getAppValue('s3shadowmigrator', 'exclusion_mode', 'blacklist'),
             'excluded_users'      => $this->config->getAppValue('s3shadowmigrator', 'excluded_users', ''),
+            'mirror_paths'        => $this->config->getAppValue('s3shadowmigrator', 'mirror_paths', 'Notes/'),
             'available_mounts'    => $mounts,
             'available_users'     => $users,
             'available_groups'    => $groups,

@@ -52,8 +52,63 @@ function s3sm_init() {
             throttle_mode:       document.getElementById('s3sm-throttle-mode').value,
             custom_throttle_mb:  document.getElementById('s3sm-custom-throttle').value,
             exclusion_mode:      modeEl ? modeEl.value : 'blacklist',
-            excluded_users:      excluded.join(',')
+            excluded_users:      excluded.join(','),
+            mirror_paths:        document.getElementById('s3sm-mirror-paths') ? document.getElementById('s3sm-mirror-paths').value : ''
         };
+    }
+
+    // ── Mirror Paths Grid Logic ───────────────────────────────────────────────
+    var mirrorInput = document.getElementById('s3sm-mirror-input');
+    var addMirrorBtn = document.getElementById('s3sm-add-mirror-btn');
+    var mirrorGrid = document.getElementById('s3sm-mirror-grid');
+    var mirrorPathsHidden = document.getElementById('s3sm-mirror-paths');
+
+    function renderMirrorGrid() {
+        if (!mirrorGrid || !mirrorPathsHidden) return;
+        mirrorGrid.innerHTML = '';
+        var paths = mirrorPathsHidden.value.split(',').map(function(s) { return s.trim(); }).filter(function(s) { return s.length > 0; });
+        paths.forEach(function(p) {
+            var chip = document.createElement('div');
+            chip.style.cssText = 'background:var(--color-primary-light, #e0f2fe); color:var(--color-primary-text-dark, #0369a1); padding:4px 8px; border-radius:16px; font-size:13px; display:flex; align-items:center; gap:6px; border:1px solid var(--color-primary, #0082c9);';
+            var text = document.createElement('span');
+            text.textContent = p;
+            var closeBtn = document.createElement('span');
+            closeBtn.textContent = '×';
+            closeBtn.style.cssText = 'cursor:pointer; font-weight:bold; font-size:16px; line-height:1; padding:0 2px;';
+            closeBtn.addEventListener('click', function() {
+                var newPaths = mirrorPathsHidden.value.split(',').map(function(s){return s.trim();}).filter(function(s){return s!==p && s.length>0;});
+                mirrorPathsHidden.value = newPaths.join(',');
+                renderMirrorGrid();
+            });
+            chip.appendChild(text);
+            chip.appendChild(closeBtn);
+            mirrorGrid.appendChild(chip);
+        });
+    }
+
+    if (addMirrorBtn && mirrorInput && mirrorPathsHidden) {
+        addMirrorBtn.addEventListener('click', function(e) {
+            e.preventDefault();
+            var val = mirrorInput.value.trim();
+            if (val) {
+                var paths = mirrorPathsHidden.value.split(',').map(function(s){return s.trim();}).filter(function(s){return s.length>0;});
+                if (paths.indexOf(val) === -1) {
+                    paths.push(val);
+                    mirrorPathsHidden.value = paths.join(',');
+                }
+                mirrorInput.value = '';
+                renderMirrorGrid();
+            }
+        });
+        
+        mirrorInput.addEventListener('keypress', function(e) {
+            if (e.key === 'Enter') {
+                e.preventDefault();
+                addMirrorBtn.click();
+            }
+        });
+
+        renderMirrorGrid();
     }
 
     // ── Save ──────────────────────────────────────────────────────────────────

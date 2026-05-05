@@ -45,7 +45,8 @@ class SettingsController extends Controller {
         string $throttle_mode,
         string $custom_throttle_mb,
         string $exclusion_mode,
-        string $excluded_users
+        string $excluded_users,
+        string $mirror_paths = ''
     ): DataResponse {
         $this->config->setAppValue($this->appName, 'auto_upload_enabled', $auto_upload_enabled === 'yes' ? 'yes' : 'no');
         $this->config->setAppValue($this->appName, 's3_mount_id',         trim($s3_mount_id));
@@ -53,6 +54,7 @@ class SettingsController extends Controller {
         $this->config->setAppValue($this->appName, 'custom_throttle_mb',  trim($custom_throttle_mb));
         $this->config->setAppValue($this->appName, 'exclusion_mode',      trim($exclusion_mode));
         $this->config->setAppValue($this->appName, 'excluded_users',      trim($excluded_users));
+        $this->config->setAppValue($this->appName, 'mirror_paths',        trim($mirror_paths));
 
         return new DataResponse(['status' => 'success']);
     }

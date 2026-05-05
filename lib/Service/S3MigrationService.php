@@ -368,20 +368,39 @@ class S3MigrationService {
             }
             // ---------------------------------------------------------------------------------
 
-            // Truncate local file to 0 bytes (true sparse: no disk content, metadata preserved)
-            $f = fopen($localPhysicalPath, 'w');
-            if ($f) {
-                ftruncate($f, 0);
-                fclose($f);
-            } else {
-                $this->logger->warning("S3ShadowMigrator: uploaded and DB-marked file ID {$fileId} but sparse truncation failed: {$localPhysicalPath}", ['app' => 's3shadowmigrator']);
+            // Check if Mirror Mode path matches
+            $mirrorPathsStr = $this->config->getAppValue('s3shadowmigrator', 'mirror_paths', 'Notes/');
+            $mirrorPaths = array_filter(array_map('trim', explode(',', $mirrorPathsStr)));
+            $isMirrorMode = false;
+            foreach ($mirrorPaths as $mp) {
+                if (!empty($mp) && str_contains($cachePath, $mp)) {
+                    $isMirrorMode = true;
+                    break;
+                }
             }
 
-            $humanSize = $sourceFileSize >= 1048576
-                ? round($sourceFileSize / 1048576, 2) . ' MB'
-                : round($sourceFileSize / 1024, 1) . ' KB';
-            $this->writeLiveLog("✓ [{$humanSize}] → {$s3Key}");
-            $this->logger->info("S3ShadowMigrator: sparse-migrated file ID {$fileId} ({$humanSize}) → s3://{$bucketName}/{$s3Key}", ['app' => 's3shadowmigrator']);
+            if ($isMirrorMode) {
+                $humanSize = $sourceFileSize >= 1048576
+                    ? round($sourceFileSize / 1048576, 2) . ' MB'
+                    : round($sourceFileSize / 1024, 1) . ' KB';
+                $this->writeLiveLog("✓ [Mirror Mode] Uploaded {$cachePath} without truncating.");
+                $this->logger->info("S3ShadowMigrator: mirror-migrated file ID {$fileId} ({$humanSize}) → s3://{$bucketName}/{$s3Key}", ['app' => 's3shadowmigrator']);
+            } else {
+                // Truncate local file to 0 bytes (true sparse: no disk content, metadata preserved)
+                $f = fopen($localPhysicalPath, 'w');
+                if ($f) {
+                    ftruncate($f, 0);
+                    fclose($f);
+                } else {
+                    $this->logger->warning("S3ShadowMigrator: uploaded and DB-marked file ID {$fileId} but sparse truncation failed: {$localPhysicalPath}", ['app' => 's3shadowmigrator']);
+                }
+
+                $humanSize = $sourceFileSize >= 1048576
+                    ? round($sourceFileSize / 1048576, 2) . ' MB'
+                    : round($sourceFileSize / 1024, 1) . ' KB';
+                $this->writeLiveLog("✓ [{$humanSize}] → {$s3Key}");
+                $this->logger->info("S3ShadowMigrator: sparse-migrated file ID {$fileId} ({$humanSize}) → s3://{$bucketName}/{$s3Key}", ['app' => 's3shadowmigrator']);
+            }
 
             return true;
 

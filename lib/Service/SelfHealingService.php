@@ -140,9 +140,26 @@ class SelfHealingService {
 
         $etagMatches = isset($row['etag']) && ((string)$row['migrated_etag'] === (string)$row['etag']);
 
+        $isMirrorMode = false;
+        if (!empty($row['path'])) {
+            $mirrorPathsStr = $this->config->getAppValue('s3shadowmigrator', 'mirror_paths', 'Notes/');
+            $mirrorPaths = array_filter(array_map('trim', explode(',', $mirrorPathsStr)));
+            foreach ($mirrorPaths as $mp) {
+                if (!empty($mp) && str_contains($row['path'], $mp)) {
+                    $isMirrorMode = true;
+                    break;
+                }
+            }
+        }
+
         // Healthy: local is properly zeroed, S3 has the object, and ETags match
-        if ($localExists && $localSize === 0 && $s3Exists && $etagMatches) {
-            return 'healthy';
+        // Or if in Mirror Mode, local is full size, S3 has the object, and ETags match
+        if ($localExists && $s3Exists && $etagMatches) {
+            if ($localSize === 0) {
+                return 'healthy';
+            } elseif ($isMirrorMode && $localSize > 0) {
+                return 'healthy';
+            }
         }
 
         // Modified by user: file has new content and new ETag. Leave it alone for Migrator to handle.
