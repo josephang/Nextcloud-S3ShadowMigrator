@@ -100,7 +100,7 @@ class SelfHealingService {
         $query = $this->db->getQueryBuilder();
         $query->select(
                 'sf.fileid', 'sf.s3_key', 'sf.is_vault', 'sf.migrated_etag',
-                'fc.path',
+                'fc.path', 'fc.etag',
                 's.id AS storage_id'
               )
               ->from('s3shadow_files', 'sf')
@@ -153,13 +153,21 @@ class SelfHealingService {
         // State Classification
         // -------------------------------------------------------------------
 
-        // Healthy: local is properly zeroed, S3 has the object
-        if ($localExists && $localSize === 0 && $s3Exists) {
+        $etagMatches = isset($row['etag']) && ((string)$row['migrated_etag'] === (string)$row['etag']);
+
+        // Healthy: local is properly zeroed, S3 has the object, and ETags match
+        if ($localExists && $localSize === 0 && $s3Exists && $etagMatches) {
             return 'healthy';
         }
 
-        // Corrupt-A: local still has content (null bytes from old ftruncate bug), S3 is fine
-        if ($localExists && $localSize > 0 && $s3Exists) {
+        // Modified by user: file has new content and new ETag. Leave it alone for Migrator to handle.
+        if ($localExists && $localSize > 0 && !$etagMatches) {
+            $this->writeLiveLog(sprintf('📝 Info [ID %d]: file modified locally (ETag changed). Skipping so migrator can upload new version.', $fileId));
+            return 'healthy';
+        }
+
+        // Corrupt-A: local still has content (null bytes from old ftruncate bug), S3 is fine, AND ETags match (file was not modified)
+        if ($localExists && $localSize > 0 && $s3Exists && $etagMatches) {
             $this->writeLiveLog(sprintf('🔧 Corrupt-A [ID %d]: local file is %d bytes (should be 0). Re-truncating.', $fileId, $localSize));
             $f = fopen($localPath, 'w');
             if ($f) {
