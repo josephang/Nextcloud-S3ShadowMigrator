@@ -155,7 +155,21 @@ class SelfHealingService {
         // Healthy: local is properly zeroed, S3 has the object, and ETags match
         // Or if in Mirror Mode, local is full size, S3 has the object, and ETags match
         if ($localExists && $s3Exists && $etagMatches) {
-            if ($localSize === 0) {
+            if ($isMirrorMode && $localSize === 0) {
+                // Mirror-Hydrate: Path is mirrored, but file was already truncated! Download it.
+                $this->writeLiveLog(sprintf('💧 Mirror-Hydrate [ID %d]: %s was truncated previously. Restoring from S3...', $fileId, $row['path']));
+                try {
+                    if ($this->hydrateFromS3($s3Key, $localPath)) {
+                        $this->writeLiveLog(sprintf('✓ [Hydrated] Successfully restored %s to local disk.', $row['path']));
+                        $this->logger->info(sprintf('S3ShadowMigrator SelfHealer: hydrated mirrored file ID %d (%s) from S3.', $fileId, $row['path']), ['app' => 's3shadowmigrator']);
+                    } else {
+                        $this->writeLiveLog(sprintf('⚠ [Hydration Failed] Could not restore %s.', $row['path']));
+                    }
+                } catch (\Exception $e) {
+                    $this->writeLiveLog(sprintf('⚠ [Hydration Error] %s: %s', $row['path'], $e->getMessage()));
+                }
+                return 'healthy'; // Treat as healthy so it doesn't count as an error
+            } elseif ($localSize === 0) {
                 return 'healthy';
             } elseif ($isMirrorMode && $localSize > 0) {
                 return 'healthy';
@@ -352,6 +366,34 @@ class SelfHealingService {
     // -------------------------------------------------------------------------
     // Helpers
     // -------------------------------------------------------------------------
+
+    /**
+     * Downloads an object directly from S3 to the specified local path.
+     * Used to hydrate files that were previously truncated but are now mirrored.
+     */
+    private function hydrateFromS3(string $s3Key, string $localPath): bool {
+        if ($s3Key === '' || $localPath === '') {
+            return false;
+        }
+
+        try {
+            $s3Config = S3ConfigHelper::getS3Config($this->config, $this->db);
+            $s3 = S3ConfigHelper::createS3Client($s3Config);
+            
+            $s3->getObject([
+                'Bucket' => $s3Config['bucket'],
+                'Key'    => $s3Key,
+                'SaveAs' => $localPath
+            ]);
+            
+            // Clear stat cache so Nextcloud knows the file is full size again
+            clearstatcache(true, $localPath);
+            return true;
+        } catch (\Exception $e) {
+            $this->logger->error('S3ShadowMigrator SelfHealer: hydration failed for ' . $s3Key . ': ' . $e->getMessage(), ['app' => 's3shadowmigrator', 'exception' => $e]);
+            return false;
+        }
+    }
 
     private function writeLiveLog(string $message): void {
         $timestamp = date('Y-m-d H:i:s');
