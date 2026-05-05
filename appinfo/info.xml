@@ -1,0 +1,31 @@
+<?xml version="1.0"?>
+<info xmlns:xsi= "http://www.w3.org/2001/XMLSchema-instance"
+      xsi:noNamespaceSchemaLocation="https://apps.nextcloud.com/schema/apps/info.xsd">
+    <id>s3shadowmigrator</id>
+    <name>S3 Shadow Migrator</name>
+    <summary>Seamlessly decouple physical file storage to S3</summary>
+    <description>
+        Silently drains local storage to an S3-compatible object store and intercepts download requests
+        with zero-bandwidth 302 Pre-signed URLs, rendering the Nextcloud host entirely stateless.
+    </description>
+    <version>1.0.0</version>
+    <licence>agpl</licence>
+    <author>josephang</author>
+
+    <namespace>S3ShadowMigrator</namespace>
+
+    <category>files</category>
+
+    <dependencies>
+        <nextcloud min-version="25" max-version="31"/>
+    </dependencies>
+
+    <background-jobs>
+        <job>OCA\S3ShadowMigrator\BackgroundJob\ShadowMigrationJob</job>
+    </background-jobs>
+
+    <settings>
+        <admin>OCA\S3ShadowMigrator\Settings\Admin</admin>
+        <admin-section>OCA\S3ShadowMigrator\Settings\AdminSection</admin-section>
+    </settings>
+</info>

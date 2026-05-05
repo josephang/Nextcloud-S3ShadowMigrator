@@ -1,0 +1,8 @@
+{
+    "name": "josephang/s3shadowmigrator",
+    "description": "Seamlessly decouple physical file storage to S3",
+    "type": "nextcloud-app",
+    "require": {
+        "aws/aws-sdk-php": "^3.0"
+    }
+}
