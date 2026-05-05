@@ -136,8 +136,17 @@ class DownloadInterceptorMiddleware {
 
         // Check if file is sparse AND hasn't been locally overwritten (ETags match)
         $updater = new \OCA\S3ShadowMigrator\Db\FileCacheUpdater($this->db, $this->logger);
-        if (!$updater->isFileSparse($node->getId(), (string)$node->getEtag())) {
+        $sparseStatus = $updater->getFileSparseStatus($node->getId(), (string)$node->getEtag());
+        
+        if ($sparseStatus === null || !$sparseStatus['is_sparse']) {
             return false; // Not a migrated sparse file, or it was overwritten locally
+        }
+
+        // Vault Check: If the file is encrypted, we CANNOT issue a 302 redirect.
+        // It must stream through Azure to be decrypted by our Storage Wrapper.
+        if ($sparseStatus['is_vault']) {
+            $this->logger->info("S3ShadowMigrator: bypassing 302 redirect for Vault file (ID {$node->getId()}). Must decrypt locally.", ['app' => 's3shadowmigrator']);
+            return false;
         }
 
         // Generate Pre-signed URL and Redirect

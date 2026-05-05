@@ -222,43 +222,79 @@ class S3MigrationService {
             }
         }
 
+        $isVault = str_contains($cachePath, '/EncryptedVault/');
+        $sourceFile = $localPhysicalPath;
+        $tempVaultFile = null;
+
+        if ($isVault) {
+            $vaultKeyHex = $this->config->getAppValue('s3shadowmigrator', 'vault_key', '');
+            if (empty($vaultKeyHex)) {
+                $this->logger->info("S3ShadowMigrator: vault_key not found. Auto-generating a new AES-256 master key.", ['app' => 's3shadowmigrator']);
+                $vaultKeyHex = bin2hex(random_bytes(32));
+                $this->config->setAppValue('s3shadowmigrator', 'vault_key', $vaultKeyHex);
+            }
+
+            $tempVaultFile = $localPhysicalPath . '.vault.tmp';
+            $ivHex = bin2hex(random_bytes(16));
+            
+            // Fast OpenSSL streaming encryption: write 32-byte IV first, then append ciphertext
+            $cmd = sprintf(
+                'echo -n %s > %s && openssl enc -aes-256-cbc -e -in %s -K %s -iv %s >> %s',
+                escapeshellarg($ivHex),
+                escapeshellarg($tempVaultFile),
+                escapeshellarg($localPhysicalPath),
+                escapeshellarg($vaultKeyHex),
+                escapeshellarg($ivHex),
+                escapeshellarg($tempVaultFile)
+            );
+            
+            exec($cmd, $output, $returnVar);
+            if ($returnVar !== 0) {
+                $this->logger->error("S3ShadowMigrator: OpenSSL encryption failed for {$cachePath}", ['app' => 's3shadowmigrator']);
+                if (file_exists($tempVaultFile)) unlink($tempVaultFile);
+                return false;
+            }
+            $sourceFile = $tempVaultFile;
+        }
+
         try {
-            $fileSize   = filesize($localPhysicalPath);
+            $sourceFileSize = filesize($sourceFile);
             $bucketName = $this->config->getAppValue('s3shadowmigrator', 's3_bucket_name', '');
 
             if (empty($bucketName)) {
                 $this->logger->error('S3ShadowMigrator: bucket name is not configured.', ['app' => 's3shadowmigrator']);
+                if ($tempVaultFile) unlink($tempVaultFile);
                 return false;
             }
 
             $s3 = $this->getS3Client();
 
             // Use multipart upload for large files
-            if ($fileSize >= self::MULTIPART_THRESHOLD_BYTES) {
-                $this->logger->info("S3ShadowMigrator: using multipart upload for file ID {$fileId} ({$fileSize} bytes).", ['app' => 's3shadowmigrator']);
-                $uploader = new MultipartUploader($s3, $localPhysicalPath, [
+            if ($sourceFileSize >= self::MULTIPART_THRESHOLD_BYTES) {
+                $this->logger->info("S3ShadowMigrator: using multipart upload for file ID {$fileId} ({$sourceFileSize} bytes).", ['app' => 's3shadowmigrator']);
+                $uploader = new \Aws\S3\MultipartUploader($s3, $sourceFile, [
                     'bucket' => $bucketName,
                     'key'    => $s3Key,
                 ]);
                 $uploader->upload();
             } else {
-                $localHash = md5_file($localPhysicalPath);
+                $localHash = md5_file($sourceFile);
                 $s3->putObject([
                     'Bucket'     => $bucketName,
                     'Key'        => $s3Key,
-                    'SourceFile' => $localPhysicalPath,
+                    'SourceFile' => $sourceFile,
                     'ContentMD5' => base64_encode(pack('H*', $localHash)),
                 ]);
             }
 
             // Mark file as sparse in custom tracking table
-            $dbSuccess = $this->fileCacheUpdater->markFileAsSparse($fileId, $fileRecord['etag'], $s3Key);
+            $dbSuccess = $this->fileCacheUpdater->markFileAsSparse($fileId, $fileRecord['etag'], $s3Key, $isVault);
 
             if ($dbSuccess) {
-                // Truncate the file to sparse instead of deleting it to preserve Nextcloud DB integrity
+                // Truncate the original file to sparse instead of deleting it
                 $f = fopen($localPhysicalPath, 'w');
                 if ($f) {
-                    ftruncate($f, $fileSize);
+                    ftruncate($f, (int)$fileRecord['size']);
                     fclose($f);
                     $this->logger->info("S3ShadowMigrator: sparse truncated file ID {$fileId} (now 0 bytes on disk) → s3://{$bucketName}/{$s3Key}", ['app' => 's3shadowmigrator']);
                 } else {
@@ -289,6 +325,9 @@ class S3MigrationService {
             ]);
             return false;
         } finally {
+            if ($tempVaultFile && file_exists($tempVaultFile)) {
+                unlink($tempVaultFile);
+            }
             if ($locked && $node instanceof File) {
                 try {
                     $node->unlock(ILockingProvider::LOCK_EXCLUSIVE);

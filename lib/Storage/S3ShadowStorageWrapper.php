@@ -73,9 +73,12 @@ class S3ShadowStorageWrapper extends Wrapper {
         }
 
         // Check if file is sparse
-        if (!$this->getFileCacheUpdater()->isFileSparse($fileId)) {
+        $sparseStatus = $this->getFileCacheUpdater()->getFileSparseStatus($fileId);
+        if ($sparseStatus === null || !$sparseStatus['is_sparse']) {
             return $this->storage->fopen($path, $mode);
         }
+        
+        $isVault = $sparseStatus['is_vault'];
 
         // FILE IS SPARSE. 
         // 1. Block internal background processes (Preview, Search, Scanner)
@@ -107,8 +110,44 @@ class S3ShadowStorageWrapper extends Wrapper {
             $this->getS3Client();
             
             $s3Url = "s3://{$bucketName}/{$s3Key}";
-            $this->logger->info("S3ShadowMigrator: proxying streaming read for sparse file '{$path}' from S3", ['app' => 's3shadowmigrator']);
             
+            if ($isVault) {
+                $this->logger->info("S3ShadowMigrator: proxying and decrypting Vault file '{$path}' from S3", ['app' => 's3shadowmigrator']);
+                $vaultKeyHex = $this->config->getAppValue('s3shadowmigrator', 'vault_key', '');
+                
+                $tempEncFile = tempnam(sys_get_temp_dir(), 's3v_');
+                $tempDecFile = tempnam(sys_get_temp_dir(), 's3d_');
+                
+                // Copy S3 stream to local temp
+                copy($s3Url, $tempEncFile);
+                
+                // Read 32-byte Hex IV
+                $ivHex = file_get_contents($tempEncFile, false, null, 0, 32);
+                
+                // Decrypt using OpenSSL CLI (skip first 32 bytes)
+                $cmd = sprintf(
+                    'tail -c +33 %s | openssl enc -d -aes-256-cbc -K %s -iv %s -out %s',
+                    escapeshellarg($tempEncFile),
+                    escapeshellarg($vaultKeyHex),
+                    escapeshellarg($ivHex),
+                    escapeshellarg($tempDecFile)
+                );
+                exec($cmd, $output, $returnVar);
+                
+                unlink($tempEncFile); // Cleanup encrypted temp
+                
+                if ($returnVar !== 0) {
+                    $this->logger->error("S3ShadowMigrator: failed to decrypt Vault file {$path}", ['app' => 's3shadowmigrator']);
+                    unlink($tempDecFile);
+                    return false;
+                }
+                
+                $fp = fopen($tempDecFile, $mode);
+                unlink($tempDecFile); // Linux trick: file deleted from directory but readable until closed
+                return $fp;
+            }
+
+            $this->logger->info("S3ShadowMigrator: proxying streaming read for sparse file '{$path}' from S3", ['app' => 's3shadowmigrator']);
             return fopen($s3Url, $mode);
         } catch (\Exception $e) {
             $this->logger->error("S3ShadowMigrator: failed to open S3 stream for sparse file '{$path}': " . $e->getMessage(), ['app' => 's3shadowmigrator']);

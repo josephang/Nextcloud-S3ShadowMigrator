@@ -46,7 +46,7 @@ class FileCacheUpdater {
      * @param string $s3Key The file's destination key in S3
      * @return bool True on success
      */
-    public function markFileAsSparse(int $fileId, string $etag, string $s3Key): bool {
+    public function markFileAsSparse(int $fileId, string $etag, string $s3Key, bool $isVault = false): bool {
         $this->db->beginTransaction();
         try {
             // Check if exists first to do an UPSERT
@@ -60,6 +60,7 @@ class FileCacheUpdater {
                       ->set('migrated_at', $query->createNamedParameter(date('Y-m-d H:i:s')))
                       ->set('migrated_etag', $query->createNamedParameter($etag))
                       ->set('s3_key', $query->createNamedParameter($s3Key))
+                      ->set('is_vault', $query->createNamedParameter($isVault, \OCP\DB\QueryBuilder\IQueryBuilder::PARAM_BOOL))
                       ->where($query->expr()->eq('fileid', $query->createNamedParameter($fileId)));
             } else {
                 $query->insert('s3shadow_files')
@@ -67,7 +68,8 @@ class FileCacheUpdater {
                           'fileid' => $query->createNamedParameter($fileId),
                           'migrated_at' => $query->createNamedParameter(date('Y-m-d H:i:s')),
                           'migrated_etag' => $query->createNamedParameter($etag),
-                          's3_key' => $query->createNamedParameter($s3Key)
+                          's3_key' => $query->createNamedParameter($s3Key),
+                          'is_vault' => $query->createNamedParameter($isVault, \OCP\DB\QueryBuilder\IQueryBuilder::PARAM_BOOL)
                       ]);
             }
 
@@ -120,6 +122,41 @@ class FileCacheUpdater {
                 'exception' => $e
             ]);
             return false;
+        }
+    }
+
+    /**
+     * Checks if a file is marked as sparse and if it is encrypted in the vault.
+     *
+     * @param int $fileId The file cache ID
+     * @param string $currentEtag The current ETag from oc_filecache
+     * @return array|null Returns ['is_sparse' => bool, 'is_vault' => bool] or null if not sparse
+     */
+    public function getFileSparseStatus(int $fileId, string $currentEtag = ''): ?array {
+        try {
+            $query = $this->db->getQueryBuilder();
+            $query->select('migrated_etag', 'is_vault')
+                  ->from('s3shadow_files')
+                  ->where($query->expr()->eq('fileid', $query->createNamedParameter($fileId)));
+
+            $result = $query->executeQuery();
+            $row = $result->fetch();
+            
+            if ($row === false) {
+                return null;
+            }
+
+            if ($currentEtag !== '' && isset($row['migrated_etag']) && $row['migrated_etag'] !== $currentEtag) {
+                return null;
+            }
+
+            return [
+                'is_sparse' => true,
+                'is_vault' => (bool)$row['is_vault']
+            ];
+        } catch (\Exception $e) {
+            $this->logger->error('Failed to get sparse status: ' . $e->getMessage(), ['app' => 's3shadowmigrator']);
+            return null;
         }
     }
 }
