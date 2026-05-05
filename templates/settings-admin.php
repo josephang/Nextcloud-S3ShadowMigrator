@@ -123,42 +123,49 @@
 </div>
 
 <script>
-(function() {
-
-    // ── Toggle Switch ─────────────────────────────────────────────────────────
+// Nextcloud injects settings templates asynchronously, so we must wait
+// until the elements actually exist rather than assuming they're ready.
+function s3sm_init() {
     var toggleWrap  = document.getElementById('s3sm-toggle-wrap');
     var toggleTrack = document.getElementById('s3sm-toggle-track');
     var toggleKnob  = document.getElementById('s3sm-toggle-knob');
     var toggleLabel = document.getElementById('s3sm-toggle-label');
     var checkbox    = document.getElementById('s3sm-auto-upload');
+    var saveBtn     = document.getElementById('s3sm-save');
 
-    function setToggleState(on, triggerMigration) {
-        checkbox.checked    = on;
+    // Elements not in DOM yet — Nextcloud hasn't injected the template. Retry.
+    if (!toggleWrap || !checkbox || !saveBtn) {
+        setTimeout(s3sm_init, 150);
+        return;
+    }
+
+    // ── Toggle visual helper ──────────────────────────────────────────────────
+    function updateToggleVisual(on) {
         toggleTrack.style.background = on ? '#0082c9' : '#ccc';
         toggleKnob.style.left        = on ? '24px'    : '3px';
         toggleLabel.textContent      = on ? 'Enabled'  : 'Disabled';
-
-        if (on && triggerMigration) {
-            // Save first, then kick off an immediate batch
-            saveSettings(function() {
-                triggerBatch();
-            });
-        }
     }
 
+    // ── Toggle click ──────────────────────────────────────────────────────────
     toggleWrap.addEventListener('click', function() {
         var nowOn = !checkbox.checked;
-        setToggleState(nowOn, true);
+        checkbox.checked = nowOn;
+        updateToggleVisual(nowOn);
+        if (nowOn) {
+            // Enable: save then immediately kick off a batch for terminal feedback
+            doSave(function() { doTrigger(); });
+        } else {
+            // Disable: just save
+            doSave(null);
+        }
     });
 
-    // ── Save Settings ─────────────────────────────────────────────────────────
+    // ── Save ──────────────────────────────────────────────────────────────────
     function getFormData() {
-        var checkboxes = document.querySelectorAll('.s3sm-user-checkbox');
-        var excluded   = [];
-        checkboxes.forEach(function(cb) { if (cb.checked) excluded.push(cb.value); });
-
+        var cbs      = document.querySelectorAll('.s3sm-user-checkbox');
+        var excluded = [];
+        cbs.forEach(function(cb) { if (cb.checked) excluded.push(cb.value); });
         var modeEl = document.querySelector('input[name="exclusion_mode"]:checked');
-
         return {
             auto_upload_enabled: checkbox.checked ? 'yes' : 'no',
             s3_mount_id:         document.getElementById('s3sm-mount-id').value,
@@ -169,95 +176,76 @@
         };
     }
 
-    function saveSettings(onSuccess) {
-        var btn       = document.getElementById('s3sm-save');
+    function doSave(onSuccess) {
         var statusMsg = document.getElementById('s3sm-status-msg');
-        btn.disabled      = true;
-        btn.textContent   = 'Saving…';
-
+        saveBtn.disabled    = true;
+        saveBtn.textContent = 'Saving…';
         fetch(OC.generateUrl('/apps/s3shadowmigrator/settings'), {
             method:  'POST',
             headers: { 'Content-Type': 'application/json', 'requesttoken': OC.requestToken },
             body:    JSON.stringify(getFormData())
         })
-        .then(function(r) {
-            if (!r.ok) throw new Error('HTTP ' + r.status);
-            return r.json();
-        })
+        .then(function(r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
         .then(function() {
-            statusMsg.textContent  = '✓ Saved';
-            statusMsg.style.color  = '#27ae60';
+            statusMsg.textContent = '✓ Saved';
+            statusMsg.style.color = '#27ae60';
             setTimeout(function() { statusMsg.textContent = ''; }, 3000);
             if (onSuccess) onSuccess();
         })
         .catch(function(e) {
-            statusMsg.textContent = '✗ Error saving: ' + e.message;
+            statusMsg.textContent = '✗ Error: ' + e.message;
             statusMsg.style.color = '#e74c3c';
         })
         .finally(function() {
-            btn.disabled    = false;
-            btn.textContent = 'Save Settings';
+            saveBtn.disabled    = false;
+            saveBtn.textContent = 'Save Settings';
         });
     }
 
-    document.getElementById('s3sm-save').addEventListener('click', function() {
-        saveSettings(null);
-    });
+    saveBtn.addEventListener('click', function() { doSave(null); });
 
-    // ── Immediate Trigger ─────────────────────────────────────────────────────
-    function triggerBatch() {
+    // ── Trigger immediate batch ───────────────────────────────────────────────
+    function doTrigger() {
+        var logEl    = document.getElementById('s3sm-live-log');
         var statusEl = document.getElementById('s3sm-live-status');
-        statusEl.textContent    = 'Starting…';
-        statusEl.style.color    = '#f39c12';
-
-        var logEl = document.getElementById('s3sm-live-log');
-        logEl.textContent = '⏳ Triggering migration batch…\n';
-
+        if (logEl) logEl.textContent = '⏳ Triggering migration batch…\n';
+        if (statusEl) { statusEl.textContent = 'Starting…'; statusEl.style.color = '#f39c12'; }
         fetch(OC.generateUrl('/apps/s3shadowmigrator/trigger'), {
-            method:  'POST',
-            headers: { 'Content-Type': 'application/json', 'requesttoken': OC.requestToken },
-            body:    JSON.stringify({})
+            method: 'POST', headers: { 'Content-Type': 'application/json', 'requesttoken': OC.requestToken },
+            body: JSON.stringify({})
         })
         .then(function(r) { return r.json(); })
         .then(function(data) {
-            if (data.log && data.log.trim() !== '') {
+            if (logEl && data.log && data.log.trim()) {
                 logEl.textContent = data.log;
-            } else {
-                logEl.textContent = '✓ Daemon started. Polling for updates…';
+                var w = document.getElementById('s3sm-live-log-wrapper');
+                if (w) w.scrollTop = w.scrollHeight;
             }
-            var wrapper = document.getElementById('s3sm-live-log-wrapper');
-            wrapper.scrollTop = wrapper.scrollHeight;
         })
-        .catch(function(e) {
-            logEl.textContent = '✗ Trigger failed: ' + e.message;
-        });
+        .catch(function(e) { if (logEl) logEl.textContent = '✗ Trigger error: ' + e.message; });
     }
 
-    // ── Live Log Poll (every 2s) ──────────────────────────────────────────────
+    // ── Live log poll every 2s ────────────────────────────────────────────────
     setInterval(function() {
         fetch(OC.generateUrl('/apps/s3shadowmigrator/status'), {
             headers: { 'requesttoken': OC.requestToken }
         })
-        .then(function(r) {
-            if (!r.ok) throw new Error('HTTP ' + r.status);
-            return r.json();
-        })
+        .then(function(r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
         .then(function(data) {
-            var logEl   = document.getElementById('s3sm-live-log');
-            var wrapper = document.getElementById('s3sm-live-log-wrapper');
+            var logEl    = document.getElementById('s3sm-live-log');
+            var wrapper  = document.getElementById('s3sm-live-log-wrapper');
             var statusEl = document.getElementById('s3sm-live-status');
             var log = data.log || '';
-            logEl.textContent     = log.trim() !== '' ? log : '⏳ Daemon idle or not yet started. Enable daemon and wait for next cron cycle.';
-            statusEl.textContent  = 'Live ●';
-            statusEl.style.color  = '#58d68d';
-            wrapper.scrollTop     = wrapper.scrollHeight;
+            if (logEl) logEl.textContent = log.trim() ? log : '⏳ Daemon idle or not yet started. Enable daemon and wait for next cron cycle.';
+            if (statusEl) { statusEl.textContent = 'Live ●'; statusEl.style.color = '#58d68d'; }
+            if (wrapper) wrapper.scrollTop = wrapper.scrollHeight;
         })
         .catch(function() {
             var statusEl = document.getElementById('s3sm-live-status');
-            statusEl.textContent = '✗ Error';
-            statusEl.style.color = '#e74c3c';
+            if (statusEl) { statusEl.textContent = '✗ Error'; statusEl.style.color = '#e74c3c'; }
         });
     }, 2000);
+}
 
-}());
+s3sm_init();
 </script>
