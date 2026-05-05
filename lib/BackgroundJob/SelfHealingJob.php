@@ -30,8 +30,8 @@ class SelfHealingJob extends TimedJob {
         $this->config         = $config;
         $this->logger         = $logger;
 
-        // Run once per hour — aggressive enough to catch issues without hammering S3
-        $this->setInterval(3600);
+        // Run every 5 minutes (acts as a continuous daemon wrapper)
+        $this->setInterval(300);
     }
 
     /**
@@ -44,31 +44,32 @@ class SelfHealingJob extends TimedJob {
             return;
         }
 
-        $this->logger->info('S3ShadowMigrator SelfHealingJob: starting hourly audit.', ['app' => 's3shadowmigrator']);
+        $this->logger->info('S3ShadowMigrator SelfHealingJob: continuous background daemon started.', ['app' => 's3shadowmigrator']);
 
-        try {
-            $stats = $this->healingService->runFullAudit();
+        $startTime = microtime(true);
+        $totalProcessed = 0;
 
-            if ($stats['critical'] > 0) {
-                $this->logger->critical(sprintf(
-                    'S3ShadowMigrator SelfHealingJob: %d critical data loss event(s) detected. Check Nextcloud logs and admin Redis dashboard immediately.',
-                    $stats['critical']
-                ), ['app' => 's3shadowmigrator']);
+        // Loop continuously for exactly 4 minutes (240 seconds)
+        while (microtime(true) - $startTime < 240) {
+            try {
+                // Run one chunk of the audit (DB or S3)
+                $processed = $this->healingService->runAuditBatch();
+                $totalProcessed += $processed;
+
+                if ($processed === 0) {
+                    // Current phase is fully idle or bucket is empty.
+                    // Sleep to prevent tight loop CPU spinning before next tick.
+                    sleep(10);
+                }
+            } catch (\Exception $e) {
+                $this->logger->error('S3ShadowMigrator SelfHealingJob: unhandled exception in loop: ' . $e->getMessage(), [
+                    'app'       => 's3shadowmigrator',
+                    'exception' => $e,
+                ]);
+                break;
             }
-
-            $this->logger->info(sprintf(
-                'S3ShadowMigrator SelfHealingJob: audit complete. fixed=%d re-queued=%d critical=%d orphan-s3=%d',
-                $stats['fixed_a'],
-                $stats['fixed_c'],
-                $stats['critical'],
-                $stats['orphan_s3']
-            ), ['app' => 's3shadowmigrator']);
-
-        } catch (\Exception $e) {
-            $this->logger->error('S3ShadowMigrator SelfHealingJob: unhandled exception: ' . $e->getMessage(), [
-                'app'       => 's3shadowmigrator',
-                'exception' => $e,
-            ]);
         }
+
+        $this->logger->info("S3ShadowMigrator SelfHealingJob: daemon gracefully exited after 4 mins. Items processed: {$totalProcessed}.", ['app' => 's3shadowmigrator']);
     }
 }

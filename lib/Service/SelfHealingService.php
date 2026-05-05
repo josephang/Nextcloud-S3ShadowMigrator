@@ -46,54 +46,29 @@ class SelfHealingService {
     // -------------------------------------------------------------------------
 
     /**
-     * Run the full two-phase audit: DB-tracked files, then S3 bucket scan.
-     * Returns a stats array for use by the background job.
+     * Run a single batch of the self-healing audit.
+     * Checks the current phase (DB or S3) from config and runs a chunk.
+     * Returns the number of items processed.
      */
-    public function runFullAudit(): array {
-        $stats = [
-            'scanned'   => 0,
-            'healthy'   => 0,
-            'fixed_a'   => 0,  // Corrupt-A: re-truncated
-            'fixed_c'   => 0,  // Corrupt-C: re-queued for migration
-            'critical'  => 0,  // Corrupt-B: data loss detected
-            'orphan_db' => 0,  // Stale DB rows (file deleted by user)
-            'orphan_s3' => 0,  // S3 objects with no DB record
-            'zero_s3'   => 0,  // 0-byte S3 objects (bad upload)
-            'errors'    => 0,
-        ];
-
-        $this->writeLiveLog('=== Self-Healing Audit Started ===');
-
-        // Phase 1: Audit all files tracked in oc_s3shadow_files
-        $this->auditDbTrackedFiles($stats);
-
-        // Phase 2: Scan the S3 bucket for orphaned and corrupted objects
-        $this->scanBucketForOrphans($stats);
-
-        $summary = sprintf(
-            'Healer complete: scanned=%d healthy=%d fixed=%d re-queued=%d critical=%d orphan-db=%d orphan-s3=%d zero-s3=%d errors=%d',
-            $stats['scanned'],
-            $stats['healthy'],
-            $stats['fixed_a'],
-            $stats['fixed_c'],
-            $stats['critical'],
-            $stats['orphan_db'],
-            $stats['orphan_s3'],
-            $stats['zero_s3'],
-            $stats['errors']
-        );
-
-        $this->writeLiveLog('=== ' . $summary . ' ===');
-        $this->logger->info('S3ShadowMigrator SelfHealer: ' . $summary, ['app' => 's3shadowmigrator']);
-
-        return $stats;
+    public function runAuditBatch(): int {
+        $phase = $this->config->getAppValue('s3shadowmigrator', 'self_heal_phase', 'db_audit');
+        
+        if ($phase === 'db_audit') {
+            return $this->auditDbTrackedFilesChunk();
+        } elseif ($phase === 's3_audit') {
+            return $this->scanBucketForOrphansChunk();
+        } else {
+            $this->config->setAppValue('s3shadowmigrator', 'self_heal_phase', 'db_audit');
+            return 0;
+        }
     }
 
     // -------------------------------------------------------------------------
     // Phase 1: DB-Tracked File Audit
     // -------------------------------------------------------------------------
 
-    private function auditDbTrackedFiles(array &$stats): void {
+    private function auditDbTrackedFilesChunk(): int {
+        $lastId = (int)$this->config->getAppValue('s3shadowmigrator', 'self_heal_last_fileid', '0');
         $dataDir = rtrim($this->config->getSystemValue('datadirectory', '/var/www/nextcloud/data'), '/');
 
         // Join with filecache + storages so we can reconstruct the physical path
@@ -105,25 +80,35 @@ class SelfHealingService {
               )
               ->from('s3shadow_files', 'sf')
               ->leftJoin('sf', 'filecache',  'fc', $query->expr()->eq('sf.fileid', 'fc.fileid'))
-              ->leftJoin('fc', 'storages',   's',  $query->expr()->eq('fc.storage', 's.numeric_id'));
+              ->leftJoin('fc', 'storages',   's',  $query->expr()->eq('fc.storage', 's.numeric_id'))
+              ->where($query->expr()->gt('sf.fileid', $query->createNamedParameter($lastId)))
+              ->orderBy('sf.fileid', 'ASC')
+              ->setMaxResults(500);
 
         $rows = $query->executeQuery()->fetchAll();
 
-        $this->writeLiveLog('Phase 1: auditing ' . count($rows) . ' DB-tracked files...');
+        if (empty($rows)) {
+            $this->writeLiveLog('=== DB Audit Complete. Switching to S3 Bucket Scan ===');
+            $this->config->setAppValue('s3shadowmigrator', 'self_heal_last_fileid', '0');
+            $this->config->setAppValue('s3shadowmigrator', 'self_heal_phase', 's3_audit');
+            return 0;
+        }
 
+        $highestId = $lastId;
         foreach ($rows as $row) {
-            $stats['scanned']++;
+            $highestId = (int)$row['fileid'];
             try {
-                $result = $this->auditSingleFile($row, $dataDir);
-                $stats[$result]++;
+                $this->auditSingleFile($row, $dataDir);
             } catch (\Exception $e) {
-                $stats['errors']++;
                 $this->writeLiveLog('⚠ Error auditing file ID ' . $row['fileid'] . ': ' . $e->getMessage());
                 $this->logger->error('SelfHealer: unexpected error auditing file ID ' . $row['fileid'] . ': ' . $e->getMessage(), [
                     'app' => 's3shadowmigrator', 'exception' => $e,
                 ]);
             }
         }
+        
+        $this->config->setAppValue('s3shadowmigrator', 'self_heal_last_fileid', (string)$highestId);
+        return count($rows);
     }
 
     /**
@@ -259,84 +244,91 @@ class SelfHealingService {
     // -------------------------------------------------------------------------
 
     /**
-     * Lists every object in the configured S3 bucket (paginated) and checks:
+     * Lists objects in the configured S3 bucket (paginated in chunks of 1000) and checks:
      *   1. Whether the object has a matching row in oc_s3shadow_files (orphaned if not)
      *   2. Whether the object is 0 bytes (indicates a failed upload)
      */
-    private function scanBucketForOrphans(array &$stats): void {
-        $this->writeLiveLog('Phase 2: scanning S3 bucket for orphaned/corrupt objects...');
-
+    private function scanBucketForOrphansChunk(): int {
+        $continuationToken = $this->config->getAppValue('s3shadowmigrator', 'self_heal_s3_token', '');
+        
         try {
             $s3Config = S3ConfigHelper::getS3Config($this->config, $this->db);
             $s3       = S3ConfigHelper::createS3Client($s3Config);
             $bucket   = $s3Config['bucket'];
 
-            // Pre-load all tracked S3 keys for O(1) lookup (avoids N+1 queries)
+            $params = ['Bucket' => $bucket, 'MaxKeys' => 1000];
+            if ($continuationToken !== '') {
+                $params['ContinuationToken'] = $continuationToken;
+            }
+
+            $result  = $s3->listObjectsV2($params);
+            $objects = $result['Contents'] ?? [];
+
+            if (empty($objects)) {
+                $this->writeLiveLog('=== S3 Bucket Scan Complete. Switching to DB Audit ===');
+                $this->config->setAppValue('s3shadowmigrator', 'self_heal_s3_token', '');
+                $this->config->setAppValue('s3shadowmigrator', 'self_heal_phase', 'db_audit');
+                return 0;
+            }
+
+            // To avoid N+1 queries, pull just the keys we need from the DB
+            $keysToCheck = [];
+            foreach ($objects as $obj) {
+                $keysToCheck[] = (string)$obj['Key'];
+            }
+            
             $dbQuery = $this->db->getQueryBuilder();
-            $dbQuery->select('s3_key')->from('s3shadow_files');
-            $dbRows      = $dbQuery->executeQuery()->fetchAll();
+            // Use IN array to fetch matched keys efficiently
+            $dbQuery->select('s3_key')
+                    ->from('s3shadow_files')
+                    ->where($dbQuery->expr()->in('s3_key', $dbQuery->createNamedParameter(
+                        $keysToCheck,
+                        \Doctrine\DBAL\Connection::PARAM_STR_ARRAY
+                    )));
+            
+            $dbRows = $dbQuery->executeQuery()->fetchAll();
             $trackedKeys = array_flip(array_column($dbRows, 's3_key'));
 
-            $totalObjects   = 0;
-            $orphanCount    = 0;
-            $zeroByteCount  = 0;
-            $continuationToken = null;
+            foreach ($objects as $obj) {
+                $key  = (string)$obj['Key'];
+                $size = (int)($obj['Size'] ?? -1);
 
-            // Paginate through all S3 objects
-            do {
-                $params = ['Bucket' => $bucket, 'MaxKeys' => 1000];
-                if ($continuationToken !== null) {
-                    $params['ContinuationToken'] = $continuationToken;
+                // Check 1: orphaned (no DB tracking record)
+                if (!isset($trackedKeys[$key])) {
+                    $this->writeLiveLog(sprintf('⚠ Orphan-S3: "%s" in bucket has no DB tracking record.', $key));
+                    $this->logger->warning(sprintf(
+                        'S3ShadowMigrator SelfHealer: S3 object "%s" exists in bucket but has no row in oc_s3shadow_files.',
+                        $key
+                    ), ['app' => 's3shadowmigrator']);
                 }
 
-                $result  = $s3->listObjectsV2($params);
-                $objects = $result['Contents'] ?? [];
-
-                foreach ($objects as $obj) {
-                    $totalObjects++;
-                    $key  = (string)$obj['Key'];
-                    $size = (int)($obj['Size'] ?? -1);
-
-                    // Check 1: orphaned (no DB tracking record)
-                    if (!isset($trackedKeys[$key])) {
-                        $orphanCount++;
-                        $stats['orphan_s3']++;
-                        $this->writeLiveLog(sprintf('⚠ Orphan-S3: "%s" in bucket has no DB tracking record.', $key));
-                        $this->logger->warning(sprintf(
-                            'S3ShadowMigrator SelfHealer: S3 object "%s" exists in bucket but has no row in oc_s3shadow_files.',
-                            $key
-                        ), ['app' => 's3shadowmigrator']);
-                    }
-
-                    // Check 2: zero-byte object (upload failed mid-stream)
-                    if ($size === 0) {
-                        $zeroByteCount++;
-                        $stats['zero_s3']++;
-                        $this->writeLiveLog(sprintf('⚠ Zero-S3: "%s" is 0 bytes in the bucket — upload may have failed.', $key));
-                        $this->logger->warning(sprintf(
-                            'S3ShadowMigrator SelfHealer: S3 object "%s" is 0 bytes — this likely indicates a failed upload.',
-                            $key
-                        ), ['app' => 's3shadowmigrator']);
-                    }
+                // Check 2: zero-byte object (upload failed mid-stream)
+                if ($size === 0) {
+                    $this->writeLiveLog(sprintf('⚠ Zero-S3: "%s" is 0 bytes in the bucket — upload may have failed.', $key));
+                    $this->logger->warning(sprintf(
+                        'S3ShadowMigrator SelfHealer: S3 object "%s" is 0 bytes — this likely indicates a failed upload.',
+                        $key
+                    ), ['app' => 's3shadowmigrator']);
                 }
+            }
 
-                $continuationToken = ($result['IsTruncated'] ?? false)
-                    ? ($result['NextContinuationToken'] ?? null)
-                    : null;
+            if (!empty($result['IsTruncated']) && !empty($result['NextContinuationToken'])) {
+                $this->config->setAppValue('s3shadowmigrator', 'self_heal_s3_token', $result['NextContinuationToken']);
+            } else {
+                $this->writeLiveLog('=== S3 Bucket Scan Complete. Switching to DB Audit ===');
+                $this->config->setAppValue('s3shadowmigrator', 'self_heal_s3_token', '');
+                $this->config->setAppValue('s3shadowmigrator', 'self_heal_phase', 'db_audit');
+            }
 
-            } while ($continuationToken !== null);
-
-            $this->writeLiveLog(sprintf(
-                '✓ Bucket scan complete: %d total objects, %d orphaned, %d zero-byte.',
-                $totalObjects, $orphanCount, $zeroByteCount
-            ));
+            return count($objects);
 
         } catch (\Exception $e) {
-            $stats['errors']++;
-            $this->writeLiveLog('⚠ Bucket scan failed: ' . $e->getMessage());
-            $this->logger->error('S3ShadowMigrator SelfHealer: bucket scan failed: ' . $e->getMessage(), [
-                'app' => 's3shadowmigrator', 'exception' => $e,
-            ]);
+            $this->writeLiveLog('⚠ Error scanning S3 bucket: ' . $e->getMessage());
+            $this->logger->error('S3ShadowMigrator SelfHealer: S3 bucket scan error: ' . $e->getMessage(), ['app' => 's3shadowmigrator', 'exception' => $e]);
+            // Clear token to prevent infinite stuck loops if a specific chunk throws
+            $this->config->setAppValue('s3shadowmigrator', 'self_heal_s3_token', '');
+            $this->config->setAppValue('s3shadowmigrator', 'self_heal_phase', 'db_audit');
+            return 0;
         }
     }
 
