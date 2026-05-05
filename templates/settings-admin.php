@@ -21,25 +21,25 @@
         <!-- ── Daemon Toggle ─────────────────────────────── -->
         <div style="margin-bottom: 20px;">
             <strong style="display: block; margin-bottom: 6px;"><?php p($l->t('Background Migration Daemon')); ?></strong>
-            <label id="s3sm-toggle-wrap" style="display:inline-flex; align-items:center; gap: 12px; cursor: pointer;">
-                <span id="s3sm-toggle-track" style="
+            <div id="s3sm-toggle-wrap" style="display:inline-flex; align-items:center; gap: 12px; cursor: pointer; user-select: none;">
+                <div id="s3sm-toggle-track" style="
                     position: relative; display: inline-block; width: 46px; height: 24px;
                     background: <?php p($_['auto_upload_enabled'] === 'yes' ? '#0082c9' : '#ccc'); ?>;
                     border-radius: 24px; transition: background 0.2s; flex-shrink: 0;">
-                    <span id="s3sm-toggle-knob" style="
+                    <div id="s3sm-toggle-knob" style="
                         position: absolute; top: 3px;
                         left: <?php p($_['auto_upload_enabled'] === 'yes' ? '24px' : '3px'); ?>;
                         width: 18px; height: 18px; background: white;
                         border-radius: 50%; transition: left 0.2s; box-shadow: 0 1px 3px rgba(0,0,0,.3);">
-                    </span>
-                </span>
+                    </div>
+                </div>
                 <span id="s3sm-toggle-label" style="font-weight: 500; color: var(--color-main-text);">
                     <?php p($_['auto_upload_enabled'] === 'yes' ? 'Enabled' : 'Disabled'); ?>
                 </span>
                 <input type="checkbox" id="s3sm-auto-upload" name="auto_upload_enabled"
                        value="yes" style="display:none"
                        <?php if ($_['auto_upload_enabled'] === 'yes') p('checked'); ?> />
-            </label>
+            </div>
             <p style="font-size: 12px; color: var(--color-text-lighter); margin-top: 4px;">
                 When enabled, the daemon runs continuously in the background and immediately begins migrating files on toggle.
             </p>
