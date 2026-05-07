@@ -89,12 +89,13 @@ class S3ShadowStorageWrapper extends Wrapper {
         if ($stat !== false && isset($stat['blocks'])) {
             $allocatedBytes = (int)$stat['blocks'] * 512;
             if ($allocatedBytes < 65536 && $size > $allocatedBytes) {
-                // Double check for null bytes at the start to prevent false positives on tiny files
+                // SAFETY: Read a full 512-byte block. Every real file format has at least one
+                // non-null byte in the first 512 bytes. Only a ftruncate stub is purely null.
                 $f = @fopen($localPath, 'r');
                 if ($f) {
-                    $head = fread($f, 8);
+                    $head = fread($f, 512);
                     fclose($f);
-                    if ($head === str_repeat("\0", strlen($head))) {
+                    if ($head !== false && strlen($head) > 0 && $head === str_repeat("\0", strlen($head))) {
                         return true;
                     }
                 }

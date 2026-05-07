@@ -258,13 +258,16 @@ class SelfHealingService {
 
         // Filesystems allocate minimum 4KB blocks. A 500-byte sparse file will have blocks=8 (4096 bytes),
         // making it indistinguishable from a real file via stat. We check for leading null bytes to be sure.
+        // SAFETY: We read 512 bytes (one full disk block) rather than just 8.
+        // Every known real file format (MP4, JPEG, PDF, DOCX, ZIP, PNG, etc.) has at least one
+        // non-null byte in its first 512 bytes. Only a ftruncate-created sparse stub is purely null.
         if (!$isSparseLocally && $localExists && $localSize > 0) {
             $f = @fopen($localPath, 'r');
             if ($f) {
-                $head = fread($f, 8);
+                $head = fread($f, 512);
                 fclose($f);
-                // If it's literally just null bytes, it was ftruncated.
-                if ($head === str_repeat("\0", strlen($head))) {
+                // The entire read block must be null bytes — a single non-null byte means real content.
+                if ($head !== false && strlen($head) > 0 && $head === str_repeat("\0", strlen($head))) {
                     $isSparseLocally = true;
                 }
             }
