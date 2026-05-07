@@ -60,6 +60,7 @@ class FileCacheUpdater {
                       ->set('migrated_at', $query->createNamedParameter(date('Y-m-d H:i:s')))
                       ->set('migrated_etag', $query->createNamedParameter($etag))
                       ->set('s3_key', $query->createNamedParameter($s3Key))
+                      ->set('status', $query->createNamedParameter('active'))
                       ->set('is_vault', $query->createNamedParameter($isVault, \OCP\DB\QueryBuilder\IQueryBuilder::PARAM_BOOL))
                       ->where($query->expr()->eq('fileid', $query->createNamedParameter($fileId)));
             } else {
@@ -69,6 +70,7 @@ class FileCacheUpdater {
                           'migrated_at' => $query->createNamedParameter(date('Y-m-d H:i:s')),
                           'migrated_etag' => $query->createNamedParameter($etag),
                           's3_key' => $query->createNamedParameter($s3Key),
+                          'status' => $query->createNamedParameter('active'),
                           'is_vault' => $query->createNamedParameter($isVault, \OCP\DB\QueryBuilder\IQueryBuilder::PARAM_BOOL)
                       ]);
             }
@@ -126,6 +128,55 @@ class FileCacheUpdater {
     }
 
     /**
+     * Marks a file as currently in-progress upload so the SelfHealer won't touch it.
+     * Creates the row if it doesn't exist yet (pre-upload reservation).
+     */
+    public function markFileAsUploading(int $fileId, string $s3Key): void {
+        try {
+            $query = $this->db->getQueryBuilder();
+            $query->select('fileid')->from('s3shadow_files')->where($query->expr()->eq('fileid', $query->createNamedParameter($fileId)));
+            $exists = $query->executeQuery()->fetch();
+
+            $query = $this->db->getQueryBuilder();
+            if ($exists) {
+                $query->update('s3shadow_files')
+                      ->set('status', $query->createNamedParameter('uploading'))
+                      ->set('s3_key', $query->createNamedParameter($s3Key))
+                      ->where($query->expr()->eq('fileid', $query->createNamedParameter($fileId)))
+                      ->executeStatement();
+            } else {
+                $query->insert('s3shadow_files')
+                      ->values([
+                          'fileid'       => $query->createNamedParameter($fileId),
+                          'migrated_at'  => $query->createNamedParameter(date('Y-m-d H:i:s')),
+                          'migrated_etag'=> $query->createNamedParameter(''),
+                          's3_key'       => $query->createNamedParameter($s3Key),
+                          'status'       => $query->createNamedParameter('uploading'),
+                      ])
+                      ->executeStatement();
+            }
+        } catch (\Exception $e) {
+            $this->logger->warning('FileCacheUpdater: markFileAsUploading failed for ID ' . $fileId . ': ' . $e->getMessage(), ['app' => 's3shadowmigrator']);
+        }
+    }
+
+    /**
+     * Reverts an 'uploading' status back to nothing (removes the row).
+     * Called on upload failure so the file can be retried cleanly.
+     */
+    public function unmarkFileAsUploading(int $fileId): void {
+        try {
+            $query = $this->db->getQueryBuilder();
+            $query->delete('s3shadow_files')
+                  ->where($query->expr()->eq('fileid', $query->createNamedParameter($fileId)))
+                  ->andWhere($query->expr()->eq('status', $query->createNamedParameter('uploading')))
+                  ->executeStatement();
+        } catch (\Exception $e) {
+            $this->logger->warning('FileCacheUpdater: unmarkFileAsUploading failed for ID ' . $fileId . ': ' . $e->getMessage(), ['app' => 's3shadowmigrator']);
+        }
+    }
+
+    /**
      * Checks if a file is marked as sparse and if it is encrypted in the vault.
      *
      * @param int $fileId The file cache ID
@@ -135,7 +186,7 @@ class FileCacheUpdater {
     public function getFileSparseStatus(int $fileId, string $currentEtag = ''): ?array {
         try {
             $query = $this->db->getQueryBuilder();
-            $query->select('migrated_etag', 'is_vault')
+            $query->select('migrated_etag', 'is_vault', 'status')
                   ->from('s3shadow_files')
                   ->where($query->expr()->eq('fileid', $query->createNamedParameter($fileId)));
 
@@ -150,9 +201,12 @@ class FileCacheUpdater {
                 return null;
             }
 
+            $status = $row['status'] ?? 'active';
+
             return [
-                'is_sparse' => true,
-                'is_vault' => (bool)$row['is_vault']
+                'is_sparse' => ($status !== 'uploading'), // uploading rows are not yet sparse
+                'is_vault'  => (bool)$row['is_vault'],
+                'status'    => $status,
             ];
         } catch (\Exception $e) {
             $this->logger->error('Failed to get sparse status: ' . $e->getMessage(), ['app' => 's3shadowmigrator']);
@@ -200,6 +254,26 @@ class FileCacheUpdater {
             return true;
         } catch (\Exception $e) {
             $this->logger->error('SelfHealer: removeSparseMark failed for ID ' . $fileId . ': ' . $e->getMessage(), ['app' => 's3shadowmigrator']);
+            return false;
+        }
+    }
+    /**
+     * Repairs the ETag in oc_filecache for a sparse file.
+     * This is used when Nextcloud's background scanner incorrectly hashes a sparse stub's null bytes.
+     * 
+     * @param int $fileId The file cache ID
+     * @param string $correctEtag The original correct ETag (from migrated_etag)
+     */
+    public function repairEtag(int $fileId, string $correctEtag): bool {
+        try {
+            $query = $this->db->getQueryBuilder();
+            $query->update('filecache')
+                  ->set('etag', $query->createNamedParameter($correctEtag))
+                  ->where($query->expr()->eq('fileid', $query->createNamedParameter($fileId)));
+            $query->executeStatement();
+            return true;
+        } catch (\Exception $e) {
+            $this->logger->error('SelfHealer: repairEtag failed for ID ' . $fileId . ': ' . $e->getMessage(), ['app' => 's3shadowmigrator']);
             return false;
         }
     }

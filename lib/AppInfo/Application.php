@@ -25,7 +25,6 @@ class Application extends App implements IBootstrap {
     }
 
     public function boot(IBootContext $context): void {
-
         // Intercept all file reads (WebDAV + UI Streaming) using Nextcloud Event Dispatcher
         $eventDispatcher = $context->getServerContainer()->get(\OCP\EventDispatcher\IEventDispatcher::class);
         $eventDispatcher->addListener(\OCP\Files\Events\Node\BeforeNodeReadEvent::class, function($event) use ($context) {

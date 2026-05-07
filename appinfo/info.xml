@@ -35,6 +35,7 @@
         <command>OCA\S3ShadowMigrator\Command\MigrateFileCommand</command>
         <command>OCA\S3ShadowMigrator\Command\GcCommand</command>
         <command>OCA\S3ShadowMigrator\Command\RestoreUserCommand</command>
+        <command>OCA\S3ShadowMigrator\Command\RepairSizesCommand</command>
     </commands>
 
     <settings>

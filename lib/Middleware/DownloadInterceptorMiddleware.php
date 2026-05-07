@@ -77,6 +77,19 @@ class DownloadInterceptorMiddleware {
             return false;
         }
 
+        // Determine if this is an explicit user-initiated download or an inline stream/preview.
+        // Explicit downloads should force 'attachment' so the browser saves the file with the
+        // correct filename. Inline requests (media player, PDF viewer, image preview) must use
+        // 'inline' so the browser can render/play the content instead of downloading it.
+        $isExplicitDownload = (
+            str_contains($uri, '/index.php/apps/files/ajax/download') ||
+            str_contains($this->request->getParam('download', ''), '1') ||
+            $this->request->getParam('downloadStartSecret') !== null
+        );
+        $contentDisposition = $isExplicitDownload
+            ? 'attachment; filename="' . basename($node->getName()) . '"'
+            : 'inline; filename="' . basename($node->getName()) . '"';
+
 
 
         // Bypass encrypted files - they MUST be decrypted server-side
@@ -111,12 +124,14 @@ class DownloadInterceptorMiddleware {
             return false;
         }
 
-        // Check if file is sparse AND hasn't been locally overwritten (ETags match)
+        // Check if file is sparse. Pass empty ETag — detection is by status='active' only.
+        // The Migrator keeps fc.etag in sync with migrated_etag after sparsing, making an
+        // ETag check here redundant. Removing it also eliminates the scanner race window.
         $updater = new \OCA\S3ShadowMigrator\Db\FileCacheUpdater($this->db, $this->logger);
-        $sparseStatus = $updater->getFileSparseStatus($node->getId(), (string)$node->getEtag());
-        
+        $sparseStatus = $updater->getFileSparseStatus($node->getId(), '');
+
         if ($sparseStatus === null || !$sparseStatus['is_sparse']) {
-            return false; // Not a migrated sparse file, or it was overwritten locally
+            return false; // Not tracked, or currently mid-upload (status='uploading')
         }
 
         // Vault Check: If the file is encrypted, we CANNOT issue a 302 redirect.
@@ -138,10 +153,10 @@ class DownloadInterceptorMiddleware {
             $cmd = $s3->getCommand('GetObject', [
                 'Bucket'                     => $bucketName,
                 'Key'                        => $s3Key,
-                // BUG FIX: Without ResponseContentDisposition, the browser downloads the file
-                // without a proper filename (it uses the S3 key as the filename). Force the
-                // correct filename in the pre-signed URL itself.
-                'ResponseContentDisposition' => 'attachment; filename="' . basename($s3Key) . '"',
+                // Use inline disposition for media/preview, attachment for explicit downloads.
+                // This allows the browser to play videos, render PDFs/images, and stream audio
+                // directly from S3 without downloading the file first.
+                'ResponseContentDisposition' => $contentDisposition,
             ]);
 
             // Pre-signed URL valid for 1 hour (enough for very large file downloads)

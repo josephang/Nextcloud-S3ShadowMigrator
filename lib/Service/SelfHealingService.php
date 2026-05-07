@@ -49,17 +49,74 @@ class SelfHealingService {
      * Run a single batch of the self-healing audit.
      * Checks the current phase (DB or S3) from config and runs a chunk.
      * Returns the number of items processed.
+     *
+     * Uses a PostgreSQL/MySQL advisory lock (lock ID 0x53334865616C) so that if
+     * two healing jobs are scheduled concurrently (e.g. after a cron backlog),
+     * the second will skip immediately rather than processing the same files twice
+     * or racing on `oc_filecache` UPDATE statements.
      */
     public function runAuditBatch(): int {
-        $phase = $this->config->getAppValue('s3shadowmigrator', 'self_heal_phase', 'db_audit');
-        
-        if ($phase === 'db_audit') {
-            return $this->auditDbTrackedFilesChunk();
-        } elseif ($phase === 's3_audit') {
-            return $this->scanBucketForOrphansChunk();
-        } else {
-            $this->config->setAppValue('s3shadowmigrator', 'self_heal_phase', 'db_audit');
+        // Attempt to acquire a non-blocking advisory lock.
+        // If another instance already holds it, exit immediately.
+        if (!$this->acquireAdvisoryLock()) {
+            $this->logger->info('S3ShadowMigrator SelfHealer: another instance is already running. Skipping this tick.', ['app' => 's3shadowmigrator']);
             return 0;
+        }
+
+        try {
+            $phase = $this->config->getAppValue('s3shadowmigrator', 'self_heal_phase', 'db_audit');
+
+            if ($phase === 'db_audit') {
+                return $this->auditDbTrackedFilesChunk();
+            } elseif ($phase === 's3_audit') {
+                return $this->scanBucketForOrphansChunk();
+            } else {
+                $this->config->setAppValue('s3shadowmigrator', 'self_heal_phase', 'db_audit');
+                return 0;
+            }
+        } finally {
+            $this->releaseAdvisoryLock();
+        }
+    }
+
+    // Lock ID: arbitrary stable integer derived from 'S3Heal' in ASCII hex
+    private const ADVISORY_LOCK_ID = 0x5333_4865;
+
+    private function acquireAdvisoryLock(): bool {
+        try {
+            $platform = $this->db->getDatabasePlatform();
+            $platformClass = get_class($platform);
+
+            if (str_contains($platformClass, 'PostgreSQL') || str_contains($platformClass, 'Postgres')) {
+                // pg_try_advisory_lock returns true if lock was granted, false if already held
+                $result = $this->db->executeQuery('SELECT pg_try_advisory_lock(' . self::ADVISORY_LOCK_ID . ')');
+                return (bool)$result->fetchOne();
+            } elseif (str_contains($platformClass, 'MySQL') || str_contains($platformClass, 'MariaDB')) {
+                // GET_LOCK returns 1 on success, 0 if timeout (using 0-second timeout = non-blocking)
+                $result = $this->db->executeQuery("SELECT GET_LOCK('s3shadowmigrator_heal', 0)");
+                return (bool)$result->fetchOne();
+            } else {
+                // SQLite or unknown: no advisory locks — just proceed
+                return true;
+            }
+        } catch (\Exception $e) {
+            $this->logger->warning('S3ShadowMigrator SelfHealer: could not acquire advisory lock: ' . $e->getMessage(), ['app' => 's3shadowmigrator']);
+            return true; // Fail open: better to run than to deadlock
+        }
+    }
+
+    private function releaseAdvisoryLock(): void {
+        try {
+            $platform = $this->db->getDatabasePlatform();
+            $platformClass = get_class($platform);
+
+            if (str_contains($platformClass, 'PostgreSQL') || str_contains($platformClass, 'Postgres')) {
+                $this->db->executeQuery('SELECT pg_advisory_unlock(' . self::ADVISORY_LOCK_ID . ')');
+            } elseif (str_contains($platformClass, 'MySQL') || str_contains($platformClass, 'MariaDB')) {
+                $this->db->executeQuery("SELECT RELEASE_LOCK('s3shadowmigrator_heal')");
+            }
+        } catch (\Exception $e) {
+            // Ignore — connection close will release the lock automatically anyway
         }
     }
 
@@ -74,16 +131,18 @@ class SelfHealingService {
         // Join with filecache + storages so we can reconstruct the physical path
         $query = $this->db->getQueryBuilder();
         $query->select(
-                'sf.fileid', 'sf.s3_key', 'sf.is_vault', 'sf.migrated_etag',
-                'fc.path', 'fc.etag',
+                'sf.fileid', 'sf.s3_key', 'sf.is_vault', 'sf.migrated_etag', 'sf.status',
+                'fc.path', 'fc.etag', 'fc.size',
                 's.id AS storage_id'
               )
               ->from('s3shadow_files', 'sf')
               ->leftJoin('sf', 'filecache',  'fc', $query->expr()->eq('sf.fileid', 'fc.fileid'))
               ->leftJoin('fc', 'storages',   's',  $query->expr()->eq('fc.storage', 's.numeric_id'))
               ->where($query->expr()->gt('sf.fileid', $query->createNamedParameter($lastId)))
+              // CRITICAL: Never audit files the Migrator is actively uploading
+              ->andWhere($query->expr()->neq('sf.status', $query->createNamedParameter('uploading')))
               ->orderBy('sf.fileid', 'ASC')
-              ->setMaxResults(500);
+              ->setMaxResults(2000);
 
         $rows = $query->executeQuery()->fetchAll();
 
@@ -95,19 +154,33 @@ class SelfHealingService {
         }
 
         $highestId = $lastId;
+        $results = ['healthy' => 0, 'fixed_a' => 0, 'fixed_c' => 0, 'critical' => 0, 'errors' => 0];
+
         foreach ($rows as $row) {
             $highestId = (int)$row['fileid'];
             try {
-                $this->auditSingleFile($row, $dataDir);
+                $outcome = $this->auditSingleFile($row, $dataDir);
+                $results[$outcome] = ($results[$outcome] ?? 0) + 1;
             } catch (\Exception $e) {
+                $results['errors']++;
                 $this->writeLiveLog('⚠ Error auditing file ID ' . $row['fileid'] . ': ' . $e->getMessage());
                 $this->logger->error('SelfHealer: unexpected error auditing file ID ' . $row['fileid'] . ': ' . $e->getMessage(), [
                     'app' => 's3shadowmigrator', 'exception' => $e,
                 ]);
             }
         }
-        
+
         $this->config->setAppValue('s3shadowmigrator', 'self_heal_last_fileid', (string)$highestId);
+
+        // Heartbeat: always write a summary so the live log confirms the healer is active
+        $this->writeLiveLog(sprintf(
+            '🩺 Batch done [up to ID %d]: %d audited, %d fixed, %d critical, %d errors',
+            $highestId, count($rows),
+            ($results['fixed_a'] ?? 0) + ($results['fixed_c'] ?? 0),
+            $results['critical'] ?? 0,
+            $results['errors'] ?? 0
+        ));
+
         return count($rows);
     }
 
@@ -122,17 +195,37 @@ class SelfHealingService {
         $storageId = (string)($row['storage_id'] ?? '');
         $now       = date('Y-m-d H:i:s');
 
-        // Reconstruct local physical path from storage ID and filecache path
+        // Reconstruct local physical path from storage ID and filecache path.
+        // Primary: use storage_id join + filecache path (most accurate).
+        // Fallback: derive from s3_key (username/files/...) when storage_id join fails.
         $username  = str_starts_with($storageId, 'home::') ? substr($storageId, 6) : null;
         $localPath = ($username !== null && !empty($row['path']))
             ? $dataDir . '/' . $username . '/' . $row['path']
             : null;
 
+        // Fallback: s3_key is always "username/files/relative/path", which maps directly
+        // to the data directory. Use this when the storage join returned no username.
+        if ($localPath === null && !empty($s3Key)) {
+            $localPath = $dataDir . '/' . ltrim($s3Key, '/');
+        }
+
         $localExists = $localPath !== null && file_exists($localPath);
         $localSize   = $localExists ? (int)filesize($localPath) : -1;
 
-        // Lightweight S3 existence check — HeadObject only, no download
-        $s3Exists = $this->verifyS3Object($s3Key);
+        // Lazy-load S3 existence check to avoid B2 API rate-limits and bottlenecks.
+        // We only call this if we absolutely cannot determine health locally.
+        $s3Size = -1;
+        $s3Exists = null; // null = unchecked
+        $getS3 = function() use (&$s3Size, &$s3Exists, $s3Key) {
+            if ($s3Exists === null) {
+                try {
+                    $s3Size = $this->getS3ObjectSize($s3Key);
+                    $s3Exists = ($s3Size >= 0);
+                } catch (\Exception $e) {
+                    $s3Exists = false;
+                }
+            }
+        };
 
         // -------------------------------------------------------------------
         // State Classification
@@ -152,73 +245,126 @@ class SelfHealingService {
             }
         }
 
-        // Healthy: local is properly zeroed, S3 has the object, and ETags match
-        // Or if in Mirror Mode, local is full size, S3 has the object, and ETags match
-        if ($localExists && $s3Exists && $etagMatches) {
-            if ($isMirrorMode && $localSize === 0) {
-                // Mirror-Hydrate: Path is mirrored, but file was already truncated! Download it.
-                $this->writeLiveLog(sprintf('💧 Mirror-Hydrate [ID %d]: %s was truncated previously. Restoring from S3...', $fileId, $row['path']));
+        // Calculate allocation for sparsity checks
+        $allocatedBytes = $localSize;
+        if ($localExists && $localSize > 0) {
+            clearstatcache(true, $localPath);
+            $stat = @stat($localPath);
+            $allocatedBytes = isset($stat['blocks']) ? (int)$stat['blocks'] * 512 : $localSize;
+        }
+        $isSparseLocally = ($localSize === 0) || ($localSize > 0 && $allocatedBytes < 65536 && $localSize > $allocatedBytes);
+
+        // Filesystems allocate minimum 4KB blocks. A 500-byte sparse file will have blocks=8 (4096 bytes),
+        // making it indistinguishable from a real file via stat. We check for leading null bytes to be sure.
+        if (!$isSparseLocally && $localExists && $localSize > 0) {
+            $f = @fopen($localPath, 'r');
+            if ($f) {
+                $head = fread($f, 8);
+                fclose($f);
+                // If it's literally just null bytes, it was ftruncated.
+                if ($head === str_repeat("\0", strlen($head))) {
+                    $isSparseLocally = true;
+                }
+            }
+        }
+
+        // False positive scanner check: If the file is physically sparse, it could not have been modified by the user.
+        // If the ETags mismatch, the scanner hashed the null bytes. We must repair the DB ETag to restore S3 streaming.
+        if ($localExists && $isSparseLocally && !$etagMatches) {
+            $this->writeLiveLog(sprintf('🔧 Repair [ID %d]: Sparse file ETag corrupted by scanner. Restoring ETag.', $fileId));
+            $this->fileCacheUpdater->repairEtag($fileId, $row['migrated_etag']);
+            return 'fixed_a'; // Repaired DB state
+        }
+
+        // Modified by user: file has real new content and new ETag. Leave it alone for Migrator to handle.
+        if ($localExists && !$isSparseLocally && $localSize > 0 && !$etagMatches) {
+            return 'healthy';
+        }
+
+        // Healthy Sparse File check:
+        if ($localExists && $localSize > 0 && $etagMatches && !$isMirrorMode) {
+            if ($isSparseLocally) {
+                return 'healthy'; 
+            }
+        }
+
+        // Mirror-Hydrate check: if it's mirror mode and it's sparse, we MUST download it.
+        if ($localExists && $isMirrorMode && $isSparseLocally) {
+            $getS3();
+            if ($s3Exists) {
+                $this->writeLiveLog(sprintf('💧 Mirror-Hydrate [ID %d]: %s was sparse. Restoring from S3...', $fileId, $row['path']));
                 try {
                     if ($this->hydrateFromS3($s3Key, $localPath)) {
-                        $this->writeLiveLog(sprintf('✓ [Hydrated] Successfully restored %s to local disk.', $row['path']));
+                        $this->writeLiveLog(sprintf('✓ [Hydrated] Successfully restored %s.', $row['path']));
                         $this->logger->info(sprintf('S3ShadowMigrator SelfHealer: hydrated mirrored file ID %d (%s) from S3.', $fileId, $row['path']), ['app' => 's3shadowmigrator']);
-                    } else {
-                        $this->writeLiveLog(sprintf('⚠ [Hydration Failed] Could not restore %s.', $row['path']));
                     }
                 } catch (\Exception $e) {
                     $this->writeLiveLog(sprintf('⚠ [Hydration Error] %s: %s', $row['path'], $e->getMessage()));
                 }
-                return 'healthy'; // Treat as healthy so it doesn't count as an error
-            } elseif ($localSize === 0) {
-                return 'healthy';
-            } elseif ($isMirrorMode && $localSize > 0) {
-                return 'healthy';
             }
-        }
-
-        // Modified by user: file has new content and new ETag. Leave it alone for Migrator to handle.
-        if ($localExists && $localSize > 0 && !$etagMatches) {
-            $this->writeLiveLog(sprintf('📝 Info [ID %d]: file modified locally (ETag changed). Skipping so migrator can upload new version.', $fileId));
             return 'healthy';
         }
 
-        // Corrupt-A: local still has content (null bytes from old ftruncate bug), S3 is fine, AND ETags match (file was not modified)
-        if ($localExists && $localSize > 0 && $s3Exists && $etagMatches) {
-            // Ultimate safety net: if the file was modified on disk in the last 5 minutes, leave it alone.
-            // This prevents race conditions if a user is actively saving a file and the DB hasn't committed the new ETag yet.
-            clearstatcache(true, $localPath);
-            $mtime = @filemtime($localPath);
-            if ($mtime !== false && $mtime > time() - 300) {
-                $this->writeLiveLog(sprintf('⏳ Info [ID %d]: file modified very recently. Delaying Corrupt-A fix to prevent race conditions.', $fileId));
-                return 'healthy';
-            }
-
-            $this->writeLiveLog(sprintf('🔧 Corrupt-A [ID %d]: local file is %d bytes (should be 0). Re-truncating.', $fileId, $localSize));
-            $f = @fopen($localPath, 'w');
-            if ($f) {
-                ftruncate($f, 0);
-                fclose($f);
-            }
-            $this->fileCacheUpdater->updateFileStatus($fileId, 'active', $now);
-            return 'fixed_a';
+        // Healthy Mirror check: if it's mirror mode and it has real content, it's healthy.
+        if ($localExists && $isMirrorMode && !$isSparseLocally && $etagMatches) {
+            return 'healthy';
         }
 
-        // Corrupt-B: local is 0 bytes but S3 object is MISSING — data loss
-        if ($localExists && $localSize === 0 && !$s3Exists) {
-            $this->writeLiveLog(sprintf('🚨 CRITICAL [ID %d]: s3_key="%s" local=0b S3=MISSING — POSSIBLE DATA LOSS', $fileId, $s3Key));
-            $this->logger->critical(sprintf(
-                'S3ShadowMigrator SelfHealer CRITICAL: file ID %d s3_key="%s" — local file is 0 bytes AND S3 object is missing. Data may be lost.',
-                $fileId, $s3Key
-            ), ['app' => 's3shadowmigrator']);
-            $this->fileCacheUpdater->updateFileStatus($fileId, 'lost', $now);
-            return 'critical';
+        // Repair 0-byte file check (for NON-mirror files only)
+        if ($localExists && $localSize === 0 && !$isMirrorMode) {
+            $targetSize = (isset($row['size']) && (int)$row['size'] > 0) ? (int)$row['size'] : -1;
+            
+            if ($targetSize <= 0) {
+                $getS3();
+                $targetSize = $s3Size;
+            }
+
+            if ($targetSize > 0) {
+                $f = @fopen($localPath, 'w');
+                if ($f) {
+                    ftruncate($f, $targetSize);
+                    fclose($f);
+                }
+                if (isset($row['size']) && (int)$row['size'] === 0) {
+                    $this->writeLiveLog(sprintf('🔧 Repair [ID %d]: disk=0b DB=0b S3=%d bytes. Wrote sparse file + repaired DB.', $fileId, $targetSize));
+                    $this->updateFileCacheSize($fileId, $targetSize);
+                }
+                return 'fixed_a'; // Repaired locally
+            } elseif ($targetSize === -1) {
+                $getS3(); 
+                if (!$s3Exists) {
+                    $this->writeLiveLog(sprintf('🚨 CRITICAL [ID %d]: s3_key="%s" local=0b S3=MISSING — POSSIBLE DATA LOSS', $fileId, $s3Key));
+                    $this->logger->critical(sprintf('S3ShadowMigrator SelfHealer CRITICAL: file ID %d s3_key="%s" — local file is 0 bytes AND S3 object is missing.', $fileId, $s3Key), ['app' => 's3shadowmigrator']);
+                    $this->fileCacheUpdater->updateFileStatus($fileId, 'lost', $now);
+                    return 'critical';
+                }
+            }
+            return 'healthy';
         }
 
-        // Corrupt-C: local file has content but S3 upload was never completed — re-queue
-        if ($localExists && $localSize > 0 && !$s3Exists) {
-            $this->writeLiveLog(sprintf('♻ Corrupt-C [ID %d]: local intact (%d bytes) but S3 object missing. Removing sparse mark to re-queue.', $fileId, $localSize));
-            $this->fileCacheUpdater->removeSparseMark($fileId);
-            return 'fixed_c';
+        // Corrupt-A: local file has real content but SHOULD be sparse (not mirror mode)
+        if ($localExists && $localSize > 0 && !$isSparseLocally && $etagMatches && !$isMirrorMode) {
+            $getS3();
+            if ($s3Exists) {
+                $mtime = @filemtime($localPath);
+                if ($mtime !== false && $mtime > time() - 300) {
+                    $this->logger->debug(sprintf('S3ShadowMigrator SelfHealer: ID %d has real content but mtime < 5 min, deferring Corrupt-A.', $fileId), ['app' => 's3shadowmigrator']);
+                    return 'healthy';
+                }
+                
+                $this->writeLiveLog(sprintf('🔧 Corrupt-A [ID %d]: local file has %d bytes of real content (allocated %d bytes). Re-sparsing.', $fileId, $localSize, $allocatedBytes));
+                $f = @fopen($localPath, 'w');
+                if ($f) {
+                    ftruncate($f, $s3Size > 0 ? $s3Size : 0);
+                    fclose($f);
+                }
+                $this->fileCacheUpdater->updateFileStatus($fileId, 'active', $now);
+                return 'fixed_a';
+            } else {
+                $this->writeLiveLog(sprintf('♻ Corrupt-C [ID %d]: local intact (%d bytes) but S3 object missing. Removing sparse mark to re-queue.', $fileId, $localSize));
+                $this->fileCacheUpdater->removeSparseMark($fileId);
+                return 'fixed_c';
+            }
         }
 
         // Orphan-DB: local file no longer exists at all (user deleted the file — normal case)
@@ -244,30 +390,38 @@ class SelfHealingService {
     }
 
     /**
-     * Performs a lightweight S3 HeadObject check.
-     * Returns true if the object exists, false if 404.
+     * Performs a lightweight S3 HeadObject check and returns ContentLength.
+     * Returns >= 0 if the object exists, -1 if 404.
      * Throws on unexpected S3 errors (network, auth, etc).
      */
-    private function verifyS3Object(string $s3Key): bool {
+    private function getS3ObjectSize(string $s3Key): int {
         if ($s3Key === '') {
-            return false;
+            return -1;
         }
 
         try {
             $s3Config = S3ConfigHelper::getS3Config($this->config, $this->db);
             $s3 = S3ConfigHelper::createS3Client($s3Config);
-            $s3->headObject([
+            $metadata = $s3->headObject([
                 'Bucket' => $s3Config['bucket'],
                 'Key'    => $s3Key,
             ]);
-            return true;
+            return (int)$metadata['ContentLength'];
         } catch (S3Exception $e) {
             if ($e->getStatusCode() === 404) {
-                return false;
+                return -1;
             }
             // Re-throw unexpected errors (auth failure, network, etc) so they're counted as errors
             throw $e;
         }
+    }
+
+    private function updateFileCacheSize(int $fileId, int $size): void {
+        $qb = $this->db->getQueryBuilder();
+        $qb->update('filecache')
+           ->set('size', $qb->createNamedParameter($size))
+           ->where($qb->expr()->eq('fileid', $qb->createNamedParameter($fileId)))
+           ->executeStatement();
     }
 
     // -------------------------------------------------------------------------

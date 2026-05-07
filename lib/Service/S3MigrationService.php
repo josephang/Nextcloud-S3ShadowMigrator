@@ -249,6 +249,13 @@ class S3MigrationService {
             return false;
         }
 
+        $stat = stat($localPhysicalPath);
+        if ($stat !== false && $stat['blocks'] == 0 && $stat['size'] > 0) {
+            $this->logger->error("S3ShadowMigrator: CRITICAL ERROR - file ID {$fileId} is a sparse stub (Blocks: 0) but was queued for upload. Skipping to prevent S3 corruption.", ['app' => 's3shadowmigrator']);
+            $this->writeLiveLog("✗ Skipped ID {$fileId}: sparse stub on disk");
+            return false;
+        }
+
         if (!is_readable($localPhysicalPath)) {
             $this->logger->warning("S3ShadowMigrator: file ID {$fileId} is not readable at '{$localPhysicalPath}'. Skipping.", ['app' => 's3shadowmigrator']);
             return false;
@@ -312,6 +319,11 @@ class S3MigrationService {
             $bucketName = $this->getBucketName();
 
             $s3 = $this->getS3Client();
+
+            // Stamp 'uploading' in the DB BEFORE reading the file.
+            // The SelfHealer will skip any file with this status, preventing it
+            // from truncating the file to 0 bytes while we are mid-upload.
+            $this->fileCacheUpdater->markFileAsUploading($fileId, $s3Key);
 
             // Use multipart upload for large files
             if ($sourceFileSize >= self::MULTIPART_THRESHOLD_BYTES) {
@@ -386,13 +398,29 @@ class S3MigrationService {
                 $this->writeLiveLog("✓ [Mirror Mode] Uploaded {$cachePath} without truncating.");
                 $this->logger->info("S3ShadowMigrator: mirror-migrated file ID {$fileId} ({$humanSize}) → s3://{$bucketName}/{$s3Key}", ['app' => 's3shadowmigrator']);
             } else {
-                // Truncate local file to 0 bytes (true sparse: no disk content, metadata preserved)
+                // Create a Linux sparse file: content cleared, but filesize() reports the
+                // real size. Takes near-zero disk space. Stops Nextcloud's scanner from
+                // resetting oc_filecache.size to 0 (which caused the "0 bytes in UI" bug).
                 $f = fopen($localPhysicalPath, 'w');
                 if ($f) {
-                    ftruncate($f, 0);
+                    ftruncate($f, $sourceFileSize); // sparse hole, not actual disk usage
                     fclose($f);
                 } else {
                     $this->logger->warning("S3ShadowMigrator: uploaded and DB-marked file ID {$fileId} but sparse truncation failed: {$localPhysicalPath}", ['app' => 's3shadowmigrator']);
+                }
+
+                // CRITICAL: After sparse truncation the file's physical ETag changes (content is now
+                // null bytes). The migrator's query re-queues files where fc.etag != sf.migrated_etag.
+                // We MUST update oc_filecache.etag to match the pre-migration value so the migrator
+                // doesn't immediately re-upload the 0-byte sparse stub over the real S3 object.
+                try {
+                    $qb = $this->db->getQueryBuilder();
+                    $qb->update('filecache')
+                       ->set('etag', $qb->createNamedParameter($fileRecord['etag']))
+                       ->where($qb->expr()->eq('fileid', $qb->createNamedParameter($fileId)))
+                       ->executeStatement();
+                } catch (\Exception $e) {
+                    $this->logger->warning("S3ShadowMigrator: could not update filecache etag for ID {$fileId}: " . $e->getMessage(), ['app' => 's3shadowmigrator']);
                 }
 
                 $humanSize = $sourceFileSize >= 1048576
@@ -407,10 +435,12 @@ class S3MigrationService {
         } catch (MultipartUploadException $e) {
             $this->logger->error("S3ShadowMigrator: multipart upload failed for file ID {$fileId}: " . $e->getMessage(), ['app' => 's3shadowmigrator']);
             $this->writeLiveLog("✗ Multipart Error for ID {$fileId}: " . $e->getMessage());
+            $this->fileCacheUpdater->unmarkFileAsUploading($fileId);
             return false;
         } catch (S3Exception $e) {
             $this->logger->error("S3ShadowMigrator: S3 upload failed for file ID {$fileId}: " . $e->getMessage(), ['app' => 's3shadowmigrator']);
             $this->writeLiveLog("✗ S3 Error for ID {$fileId}: " . $e->getAwsErrorCode());
+            $this->fileCacheUpdater->unmarkFileAsUploading($fileId);
             return false;
         } catch (\Exception $e) {
             $this->logger->error("S3ShadowMigrator: unexpected error for file ID {$fileId}: " . $e->getMessage(), [
