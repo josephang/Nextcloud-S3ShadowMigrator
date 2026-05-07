@@ -82,8 +82,39 @@ The migrator features a rich graphical interface in Nextcloud's Administrative s
 - **Checklist UX:** Easily browse and select target Users and Groups from a scrollable checklist without having to edit complex configuration files.
 - **Real-Time Terminal:** Monitor the background daemon's live progress via the embedded Redis dashboard directly in your browser.
 
+---
+
+## Operations & Maintenance
+
+Because this app manipulates physical disk allocations behind Nextcloud's back, standard Nextcloud operations carry new implications:
+
+### 1. Backups & Restorations
+**Do NOT use `rsync` or `tar` for backups without special flags.** Since sparse files report their apparent size rather than physical size, standard backup tools will hydrate the 0-byte files, inflating a 1GB drive back to 50TB and instantly crashing your server.
+- Use `rsync --sparse` (`-S`) to preserve the 0-byte holes during migration.
+- If you suffer data loss, you must restore the `oc_s3shadow_files` table along with the database.
+
+### 2. Safely Disabling the App
+You cannot simply disable the app if you have sparse files. If you disable the app, the Storage Wrapper is removed, and Nextcloud will serve 0-byte null files to your users. 
+To safely uninstall:
+1. Disable the Migration Daemon in the UI settings.
+2. Run `occ s3shadowmigrator:restore-user` for all users to hydrate files back from S3.
+3. Once `oc_s3shadow_files` is empty, you can safely disable the app.
+
+### 3. Mirror Mode (`mirror_paths`)
+By default, the migrator creates 0-byte sparse files. However, for certain paths (like Obsidian vaults or text notes), you may want the physical file to remain intact on disk while still being backed up to S3. 
+- You can define `mirror_paths` in the settings (e.g., `Notes/`). 
+- Files matching this path are uploaded to S3 but **not** truncated. They remain fully allocated on disk, allowing fast local editing.
+
+### 4. Reading the Live Log
+The Admin UI provides a streaming log of the background daemon:
+- `✓` indicates a successful upload and sparse truncation.
+- `🔧 Corrupt-A` means the SelfHealer detected a file that should be sparse but has real content (user overwrote it). The Healer automatically re-sparsed it.
+- `♻ Corrupt-C` means the SelfHealer detected a missing S3 object. It automatically removed the sparse mark so the migrator will re-upload it.
+
+---
+
 ## Security & Encryption
-- **Hybrid Vault Encryption (NEW):** Create any folder named `EncryptedVault` and the S3 Migrator will natively encrypt its contents using an auto-generated AES-256 master key (stored in the Nextcloud database via `occ config:app:set s3shadowmigrator vault_key`). Files in this folder are encrypted at rest in S3 and seamlessly decrypted by the Azure server upon download.
+- **Hybrid Vault Encryption:** Create any folder named `EncryptedVault` and the S3 Migrator will natively encrypt its contents using an auto-generated AES-256 master key (stored in the Nextcloud database via `occ config:app:set s3shadowmigrator vault_key`). Files in this folder are encrypted at rest in S3 and seamlessly decrypted by the Azure server upon download.
 - **End-to-End Encryption (E2EE):** Fully supported. Users must use the Nextcloud Mobile/Desktop clients to encrypt their files locally. The encrypted blobs are seamlessly offloaded to S3 via the migrator.
 - **Standard Server-Side Encryption (SSE):** Not Recommended. Native Nextcloud SSE requires encrypting every file on the server, completely destroying the Zero-Egress direct streaming architecture. Use the Hybrid Vault feature instead.
 
