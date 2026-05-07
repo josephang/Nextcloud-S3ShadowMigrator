@@ -147,8 +147,13 @@ class DownloadInterceptorMiddleware {
             $s3 = $this->getS3Client();
             $bucketName = $s3Config['bucket'];
 
-            // Construct the expected S3 key: username/files/path...
-            $s3Key = $username . '/' . ltrim($node->getInternalPath(), '/');
+            // Use the authoritative S3 key from the DB record — never reconstruct from path,
+            // as shared/external mounts can produce divergent internal paths.
+            $s3Key = $sparseStatus['s3_key'];
+            if (empty($s3Key)) {
+                // Fallback: reconstruct from node path (for records pre-dating H1 fix)
+                $s3Key = $username . '/' . ltrim($node->getInternalPath(), '/');
+            }
 
             $cmd = $s3->getCommand('GetObject', [
                 'Bucket'                     => $bucketName,

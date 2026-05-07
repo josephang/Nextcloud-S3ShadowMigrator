@@ -28,6 +28,8 @@ class SelfHealingService {
     private IDBConnection $db;
     private LoggerInterface $logger;
     private FileCacheUpdater $fileCacheUpdater;
+    private ?\Aws\S3\S3Client $s3Client = null;
+    private array $s3Config = [];
 
     public function __construct(
         IConfig $config,
@@ -351,11 +353,19 @@ class SelfHealingService {
                     $this->logger->debug(sprintf('S3ShadowMigrator SelfHealer: ID %d has real content but mtime < 5 min, deferring Corrupt-A.', $fileId), ['app' => 's3shadowmigrator']);
                     return 'healthy';
                 }
+
+                // Guard: if the S3 object is 0 bytes (a previously failed upload),
+                // DO NOT re-sparse the local file — treat it as Corrupt-C instead.
+                if ($s3Size <= 0) {
+                    $this->writeLiveLog(sprintf('♻ Corrupt-C (zero-S3) [ID %d]: local intact (%d bytes) but S3 object is 0 bytes. Removing sparse mark to re-queue.', $fileId, $localSize));
+                    $this->fileCacheUpdater->removeSparseMark($fileId);
+                    return 'fixed_c';
+                }
                 
                 $this->writeLiveLog(sprintf('🔧 Corrupt-A [ID %d]: local file has %d bytes of real content (allocated %d bytes). Re-sparsing.', $fileId, $localSize, $allocatedBytes));
                 $f = @fopen($localPath, 'w');
                 if ($f) {
-                    ftruncate($f, $s3Size > 0 ? $s3Size : 0);
+                    ftruncate($f, $s3Size);
                     fclose($f);
                 }
                 $this->fileCacheUpdater->updateFileStatus($fileId, 'active', $now);
@@ -365,6 +375,12 @@ class SelfHealingService {
                 $this->fileCacheUpdater->removeSparseMark($fileId);
                 return 'fixed_c';
             }
+        }
+
+        // For any case where local file is gone, we MUST check S3 first.
+        // $s3Exists is lazily loaded — calling $getS3() here ensures it is always a bool, never null.
+        if (!$localExists) {
+            $getS3();
         }
 
         // Orphan-DB: local file no longer exists at all (user deleted the file — normal case)
@@ -389,6 +405,14 @@ class SelfHealingService {
         return 'healthy';
     }
 
+    private function getS3Client(): \Aws\S3\S3Client {
+        if ($this->s3Client === null) {
+            $this->s3Config = S3ConfigHelper::getS3Config($this->config, $this->db);
+            $this->s3Client = S3ConfigHelper::createS3Client($this->s3Config);
+        }
+        return $this->s3Client;
+    }
+
     /**
      * Performs a lightweight S3 HeadObject check and returns ContentLength.
      * Returns >= 0 if the object exists, -1 if 404.
@@ -400,10 +424,9 @@ class SelfHealingService {
         }
 
         try {
-            $s3Config = S3ConfigHelper::getS3Config($this->config, $this->db);
-            $s3 = S3ConfigHelper::createS3Client($s3Config);
+            $s3 = $this->getS3Client();
             $metadata = $s3->headObject([
-                'Bucket' => $s3Config['bucket'],
+                'Bucket' => $this->s3Config['bucket'],
                 'Key'    => $s3Key,
             ]);
             return (int)$metadata['ContentLength'];
@@ -437,9 +460,8 @@ class SelfHealingService {
         $continuationToken = $this->config->getAppValue('s3shadowmigrator', 'self_heal_s3_token', '');
         
         try {
-            $s3Config = S3ConfigHelper::getS3Config($this->config, $this->db);
-            $s3       = S3ConfigHelper::createS3Client($s3Config);
-            $bucket   = $s3Config['bucket'];
+            $s3     = $this->getS3Client(); // initializes $this->s3Config as a side-effect
+            $bucket = $this->s3Config['bucket'];
 
             $params = ['Bucket' => $bucket, 'MaxKeys' => 1000];
             if ($continuationToken !== '') {

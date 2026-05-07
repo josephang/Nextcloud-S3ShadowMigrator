@@ -34,7 +34,7 @@ class MigrateController extends Controller {
     }
 
     /**
-     * @NoAdminRequired
+     * @AdminRequired
      */
     public function migrateFile(int $fileId): DataResponse {
         if ($fileId <= 0) {

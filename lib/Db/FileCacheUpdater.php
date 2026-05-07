@@ -186,7 +186,7 @@ class FileCacheUpdater {
     public function getFileSparseStatus(int $fileId, string $currentEtag = ''): ?array {
         try {
             $query = $this->db->getQueryBuilder();
-            $query->select('migrated_etag', 'is_vault', 'status')
+            $query->select('migrated_etag', 'is_vault', 'status', 's3_key')
                   ->from('s3shadow_files')
                   ->where($query->expr()->eq('fileid', $query->createNamedParameter($fileId)));
 
@@ -207,6 +207,7 @@ class FileCacheUpdater {
                 'is_sparse' => ($status !== 'uploading'), // uploading rows are not yet sparse
                 'is_vault'  => (bool)$row['is_vault'],
                 'status'    => $status,
+                's3_key'    => (string)($row['s3_key'] ?? ''),
             ];
         } catch (\Exception $e) {
             $this->logger->error('Failed to get sparse status: ' . $e->getMessage(), ['app' => 's3shadowmigrator']);

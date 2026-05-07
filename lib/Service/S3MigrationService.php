@@ -448,6 +448,8 @@ class S3MigrationService {
                 'exception' => $e,
             ]);
             $this->writeLiveLog("✗ Error for ID {$fileId}: " . $e->getMessage());
+            // Ensure 'uploading' reservation is cleared so the file can be retried on the next pass
+            $this->fileCacheUpdater->unmarkFileAsUploading($fileId);
             return false;
         } finally {
             if ($tempVaultFile && file_exists($tempVaultFile)) {
