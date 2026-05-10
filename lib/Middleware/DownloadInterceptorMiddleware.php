@@ -70,25 +70,17 @@ class DownloadInterceptorMiddleware {
             str_contains($uri, '/remote.php/webdav') ||        // WebDAV
             str_contains($uri, '/remote.php/dav/files') ||     // DAV files
             str_contains($uri, '/index.php/apps/files/ajax/download') || // Legacy AJAX download
-            (str_contains($uri, '/download') && str_contains($uri, '/apps/files')) // Files app download
+            (str_contains($uri, '/download') && str_contains($uri, '/apps/files')) || // Files app download
+            str_contains($uri, '/remote.php/direct')           // Direct Download (Mobile App!)
         );
 
         if (!$isDownloadRoute) {
             return false;
         }
 
-        // Determine if this is an explicit user-initiated download or an inline stream/preview.
-        // Explicit downloads should force 'attachment' so the browser saves the file with the
-        // correct filename. Inline requests (media player, PDF viewer, image preview) must use
-        // 'inline' so the browser can render/play the content instead of downloading it.
-        $isExplicitDownload = (
-            str_contains($uri, '/index.php/apps/files/ajax/download') ||
-            str_contains($this->request->getParam('download', ''), '1') ||
-            $this->request->getParam('downloadStartSecret') !== null
-        );
-        $contentDisposition = $isExplicitDownload
-            ? 'attachment; filename="' . basename($node->getName()) . '"'
-            : 'inline; filename="' . basename($node->getName()) . '"';
+        // ALWAYS force Content-Disposition: attachment to ensure blazing fast downloads
+        // and prevent browsers/mobile apps from attempting to play the stream inline.
+        $contentDisposition = 'attachment; filename="' . basename($node->getName()) . '"';
 
 
 

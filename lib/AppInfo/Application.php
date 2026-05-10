@@ -8,6 +8,8 @@ use OCP\AppFramework\App;
 use OCP\AppFramework\Bootstrap\IBootContext;
 use OCP\AppFramework\Bootstrap\IBootstrap;
 use OCP\AppFramework\Bootstrap\IRegistrationContext;
+use OCA\DAV\Events\SabrePluginAddEvent;
+use OCA\S3ShadowMigrator\Dav\S3RedirectPlugin;
 use OCA\S3ShadowMigrator\Middleware\DownloadInterceptorMiddleware;
 
 class Application extends App implements IBootstrap {
@@ -25,10 +27,18 @@ class Application extends App implements IBootstrap {
     }
 
     public function boot(IBootContext $context): void {
-        // Intercept all file reads (WebDAV + UI Streaming) using Nextcloud Event Dispatcher
         $eventDispatcher = $context->getServerContainer()->get(\OCP\EventDispatcher\IEventDispatcher::class);
+
+        // --- WebDAV redirect (primary path) ---
+        $eventDispatcher->addListener(SabrePluginAddEvent::class, function (SabrePluginAddEvent $event) use ($context) {
+            $plugin = $context->getServerContainer()->get(S3RedirectPlugin::class);
+            $event->getServer()->addPlugin($plugin);
+        });
+
+        // --- Files app / direct-link redirect ---
+        // BeforeNodeReadEvent fires for /index.php/f/FILEID and Files app downloads.
         $eventDispatcher->addListener(\OCP\Files\Events\Node\BeforeNodeReadEvent::class, function($event) use ($context) {
-            /** @var \OCA\S3ShadowMigrator\Middleware\DownloadInterceptorMiddleware $middleware */
+            /** @var DownloadInterceptorMiddleware $middleware */
             $middleware = $context->getServerContainer()->get(DownloadInterceptorMiddleware::class);
             $middleware->interceptDownload($event->getNode());
         });
