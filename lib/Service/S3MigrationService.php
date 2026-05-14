@@ -196,9 +196,13 @@ class S3MigrationService {
               // COOLDOWN: Only migrate files older than 30 minutes to avoid race conditions with chunked uploads
               ->andWhere($query->expr()->lt('fc.mtime', $query->createNamedParameter(time() - 1800)))
               // EXCLUSION: Exclude files that are already sparse, UNLESS they were overwritten locally (ETag changed)
+              // We also explicitly exclude files currently marked as 'uploading' by another daemon thread.
               ->andWhere($query->expr()->orX(
                   $query->expr()->isNull('sf.fileid'),
-                  $query->expr()->neq('fc.etag', 'sf.migrated_etag')
+                  $query->expr()->andX(
+                      $query->expr()->neq('fc.etag', 'sf.migrated_etag'),
+                      $query->expr()->neq('sf.status', $query->createNamedParameter('uploading'))
+                  )
               ))
               ->andWhere($query->expr()->notLike('fc.path', $query->createNamedParameter('%/.ocdata')))
               // Order by smallest files first for faster initial drain
@@ -253,6 +257,15 @@ class S3MigrationService {
         if ($stat !== false && $stat['blocks'] == 0 && $stat['size'] > 0) {
             $this->logger->error("S3ShadowMigrator: CRITICAL ERROR - file ID {$fileId} is a sparse stub (Blocks: 0) but was queued for upload. Skipping to prevent S3 corruption.", ['app' => 's3shadowmigrator']);
             $this->writeLiveLog("✗ Skipped ID {$fileId}: sparse stub on disk");
+            
+            // Repair the ETag in oc_filecache to match the migrated ETag so it stops being queued
+            $query = $this->db->getQueryBuilder();
+            $query->select('migrated_etag')->from('s3shadow_files')->where($query->expr()->eq('fileid', $query->createNamedParameter($fileId)));
+            $res = $query->executeQuery()->fetch();
+            if ($res && !empty($res['migrated_etag'])) {
+                $this->fileCacheUpdater->repairEtag($fileId, $res['migrated_etag']);
+                $this->logger->info("S3ShadowMigrator: repaired ETag for sparse stub ID {$fileId} to prevent re-queueing.", ['app' => 's3shadowmigrator']);
+            }
             return false;
         }
 
@@ -280,50 +293,50 @@ class S3MigrationService {
         $sourceFile = $localPhysicalPath;
         $tempVaultFile = null;
 
-        if ($isVault) {
-            $vaultKeyHex = $this->config->getAppValue('s3shadowmigrator', 'vault_key', '');
-            if (empty($vaultKeyHex)) {
-                $this->logger->info("S3ShadowMigrator: vault_key not found. Auto-generating a new AES-256 master key.", ['app' => 's3shadowmigrator']);
-                $vaultKeyHex = bin2hex(random_bytes(32));
-                $this->config->setAppValue('s3shadowmigrator', 'vault_key', $vaultKeyHex);
-            }
-
-            $tempVaultFile = $localPhysicalPath . '.vault.tmp';
-            $ivHex = bin2hex(random_bytes(16));
-            
-            // Fast OpenSSL streaming encryption: write 32-byte IV first, then append ciphertext
-            $cmd = sprintf(
-                'echo -n %s > %s && openssl enc -aes-256-cbc -e -in %s -K %s -iv %s >> %s',
-                escapeshellarg($ivHex),
-                escapeshellarg($tempVaultFile),
-                escapeshellarg($localPhysicalPath),
-                escapeshellarg($vaultKeyHex),
-                escapeshellarg($ivHex),
-                escapeshellarg($tempVaultFile)
-            );
-            
-            exec($cmd, $output, $returnVar);
-            if ($returnVar !== 0) {
-                $this->logger->error("S3ShadowMigrator: OpenSSL encryption failed for {$cachePath}", ['app' => 's3shadowmigrator']);
-                if (file_exists($tempVaultFile)) unlink($tempVaultFile);
-                return false;
-            }
-            $sourceFile = $tempVaultFile;
-        }
-
         // Throttle Logic Pre-computation
         $startTime = microtime(true);
 
         try {
+            // Stamp 'uploading' in the DB BEFORE reading or encrypting the file.
+            // This prevents race conditions with other workers picking up the same file,
+            // and the SelfHealer will skip any file with this status.
+            $this->fileCacheUpdater->markFileAsUploading($fileId, $s3Key);
+
+            if ($isVault) {
+                $vaultKeyHex = $this->config->getAppValue('s3shadowmigrator', 'vault_key', '');
+                if (empty($vaultKeyHex)) {
+                    $this->logger->info("S3ShadowMigrator: vault_key not found. Auto-generating a new AES-256 master key.", ['app' => 's3shadowmigrator']);
+                    $vaultKeyHex = bin2hex(random_bytes(32));
+                    $this->config->setAppValue('s3shadowmigrator', 'vault_key', $vaultKeyHex);
+                }
+
+                $tempVaultFile = $localPhysicalPath . '.vault.tmp';
+                $ivHex = bin2hex(random_bytes(16));
+                
+                // Fast OpenSSL streaming encryption (CTR mode): write 32-byte IV first, then append ciphertext
+                // CTR mode is a stream cipher, enabling the Next.js frontend to natively support HTTP Range
+                // requests (video seeking) by mathematically calculating the IV offset for any byte chunk.
+                $cmd = sprintf(
+                    'echo -n %s > %s && openssl enc -aes-256-ctr -e -in %s -K %s -iv %s >> %s',
+                    escapeshellarg($ivHex),
+                    escapeshellarg($tempVaultFile),
+                    escapeshellarg($localPhysicalPath),
+                    escapeshellarg($vaultKeyHex),
+                    escapeshellarg($ivHex),
+                    escapeshellarg($tempVaultFile)
+                );
+                
+                exec($cmd, $output, $returnVar);
+                if ($returnVar !== 0) {
+                    throw new \RuntimeException("OpenSSL encryption failed for {$cachePath}");
+                }
+                $sourceFile = $tempVaultFile;
+            }
+
             $sourceFileSize = filesize($sourceFile);
             $bucketName = $this->getBucketName();
 
             $s3 = $this->getS3Client();
-
-            // Stamp 'uploading' in the DB BEFORE reading the file.
-            // The SelfHealer will skip any file with this status, preventing it
-            // from truncating the file to 0 bytes while we are mid-upload.
-            $this->fileCacheUpdater->markFileAsUploading($fileId, $s3Key);
 
             // Use multipart upload for large files
             if ($sourceFileSize >= self::MULTIPART_THRESHOLD_BYTES) {
@@ -468,7 +481,7 @@ class S3MigrationService {
     /**
      * Migrate a single specific file by ID. Used by CLI command and web controller.
      */
-    public function migrateFileById(int $fileId, int $s3StorageId): bool {
+    public function migrateFileById(int $fileId): bool {
         // Fetch the specific file record
         $query = $this->db->getQueryBuilder();
         $query->select('fc.fileid', 'fc.path', 'fc.size', 'fc.storage', 'fc.etag', 's.id AS storage_id_string')

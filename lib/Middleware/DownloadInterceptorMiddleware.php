@@ -126,12 +126,7 @@ class DownloadInterceptorMiddleware {
             return false; // Not tracked, or currently mid-upload (status='uploading')
         }
 
-        // Vault Check: If the file is encrypted, we CANNOT issue a 302 redirect.
-        // It must stream through Azure to be decrypted by our Storage Wrapper.
-        if ($sparseStatus['is_vault']) {
-            $this->logger->info("S3ShadowMigrator: bypassing 302 redirect for Vault file (ID {$node->getId()}). Must decrypt locally.", ['app' => 's3shadowmigrator']);
-            return false;
-        }
+        $isVault = (bool)($sparseStatus['is_vault'] ?? false);
 
         // Generate Pre-signed URL and Redirect
         try {
@@ -145,6 +140,30 @@ class DownloadInterceptorMiddleware {
             if (empty($s3Key)) {
                 // Fallback: reconstruct from node path (for records pre-dating H1 fix)
                 $s3Key = $username . '/' . ltrim($node->getInternalPath(), '/');
+            }
+
+            // For Vault files, serve the raw encrypted bytes directly from S3.
+            // The client downloads the .enc file and decrypts it locally using the
+            // companion /apps/s3shadowmigrator/decrypt page (AES-256-CTR, Web Crypto API).
+            // This eliminates ALL server-side streaming, CPU, and timeout issues.
+            if ($isVault) {
+                $vaultFilename = $node->getName() . '.enc';
+                $vaultDisposition = 'attachment; filename="' . $vaultFilename . '"';
+                $cmd = $s3->getCommand('GetObject', [
+                    'Bucket'                     => $bucketName,
+                    'Key'                        => $s3Key,
+                    'ResponseContentDisposition' => $vaultDisposition,
+                ]);
+                $presignedRequest = $s3->createPresignedRequest($cmd, '+1 hour');
+                $presignedUrl = (string)$presignedRequest->getUri();
+                $this->logger->info("S3ShadowMigrator: issuing 302 for Vault file (encrypted) key: {$s3Key}", ['app' => 's3shadowmigrator']);
+                // Pass the vault key so the client-side decryptor can decrypt without a round-trip.
+                // Safe: connection is HTTPS, pre-signed URL is single-use scoped to this file.
+                $vaultKey = $this->config->getAppValue('s3shadowmigrator', 'vault_key', '');
+                header('X-Vault-Key: ' . $vaultKey);
+                header('X-Vault-Filename: ' . $node->getName());
+                header('Location: ' . $presignedUrl, true, 302);
+                exit();
             }
 
             $cmd = $s3->getCommand('GetObject', [

@@ -159,23 +159,66 @@ class S3ShadowStorageWrapper extends Wrapper {
 
             if ($isVault) {
                 $this->logger->info("S3ShadowMigrator: proxying and decrypting Vault file '{$path}' from S3", ['app' => 's3shadowmigrator']);
-                $vaultKeyHex  = $this->config->getAppValue('s3shadowmigrator', 'vault_key', '');
-                $tempEncFile  = tempnam(sys_get_temp_dir(), 's3v_');
-                $tempDecFile  = tempnam(sys_get_temp_dir(), 's3d_');
-                copy($s3Url, $tempEncFile);
-                $ivHex = file_get_contents($tempEncFile, false, null, 0, 32);
-                $cmd = sprintf(
-                    'tail -c +33 %s | openssl enc -d -aes-256-cbc -K %s -iv %s -out %s',
-                    escapeshellarg($tempEncFile), escapeshellarg($vaultKeyHex),
-                    escapeshellarg($ivHex), escapeshellarg($tempDecFile)
-                );
-                exec($cmd, $output, $returnVar);
-                unlink($tempEncFile);
-                if ($returnVar !== 0) {
-                    $this->logger->error("S3ShadowMigrator: failed to decrypt Vault file {$path}", ['app' => 's3shadowmigrator']);
+                
+                // Peek at the first 32 bytes directly from the S3 stream to avoid downloading huge videos to /tmp
+                $s3Fp = fopen($s3Url, 'r');
+                if (!$s3Fp) return false;
+                $ivHex = fread($s3Fp, 32);
+                fclose($s3Fp);
+                
+                // Fallback: If the first 32 bytes are NOT a valid hex string, this file was
+                // migrated before the encryption feature was added and is actually plaintext.
+                if (!ctype_xdigit($ivHex) || strlen($ivHex) !== 32) {
+                    $this->logger->info("S3ShadowMigrator: Vault file {$path} is not actually encrypted. Serving plaintext stream.", ['app' => 's3shadowmigrator']);
+                    return fopen($s3Url, $mode);
+                }
+
+                // File is encrypted — stream directly from S3 through openssl without
+                // buffering the entire encrypted file to disk first, which would cause
+                // Nginx timeouts on large video files.
+                $vaultKeyHex = $this->config->getAppValue('s3shadowmigrator', 'vault_key', '');
+                $tempDecFile = tempnam(sys_get_temp_dir(), 's3d_');
+                $fifoPath    = sys_get_temp_dir() . '/s3v_' . bin2hex(random_bytes(8)) . '.fifo';
+
+                // Create a named pipe; the S3 SDK stream will feed into it while openssl reads from the other end.
+                if (!posix_mkfifo($fifoPath, 0600)) {
+                    $this->logger->error("S3ShadowMigrator: failed to create FIFO for Vault decryption of {$path}", ['app' => 's3shadowmigrator']);
                     unlink($tempDecFile);
                     return false;
                 }
+
+                // Launch openssl in the background reading from the FIFO.
+                // tail -c +33 skips the 32-byte IV header we prepended during upload.
+                $cmd = sprintf(
+                    'tail -c +33 %s | openssl enc -d -aes-256-ctr -K %s -iv %s -out %s &',
+                    escapeshellarg($fifoPath), escapeshellarg($vaultKeyHex),
+                    escapeshellarg($ivHex), escapeshellarg($tempDecFile)
+                );
+                popen($cmd, 'r');
+
+                // Stream the S3 object into the FIFO — openssl reads it concurrently.
+                $s3Stream  = fopen($s3Url, 'r');
+                $fifoWrite = fopen($fifoPath, 'w');
+                if ($s3Stream && $fifoWrite) {
+                    stream_copy_to_stream($s3Stream, $fifoWrite);
+                    fclose($fifoWrite);
+                    fclose($s3Stream);
+                }
+                unlink($fifoPath);
+
+                // Wait briefly for openssl to finish flushing output
+                $deadline = microtime(true) + 30;
+                while (filesize($tempDecFile) === 0 && microtime(true) < $deadline) {
+                    usleep(50000);
+                    clearstatcache(true, $tempDecFile);
+                }
+
+                if (filesize($tempDecFile) === 0) {
+                    $this->logger->error("S3ShadowMigrator: decryption produced empty output for Vault file {$path}", ['app' => 's3shadowmigrator']);
+                    unlink($tempDecFile);
+                    return false;
+                }
+
                 $fp = fopen($tempDecFile, $mode);
                 unlink($tempDecFile);
                 return $fp;

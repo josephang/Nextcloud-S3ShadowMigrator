@@ -75,7 +75,7 @@ class ShadowMigrationJob extends TimedJob {
 
     private function clearStaleReservation(): void {
         try {
-            $staleThreshold = time() - 600;
+            $staleThreshold = time() - 3600; // 1 hour (allows long throttled multipart uploads to finish without being killed)
             $qb = $this->db->getQueryBuilder();
             $qb->update('jobs')
                ->set('reserved_at', $qb->createNamedParameter(0, \OCP\DB\QueryBuilder\IQueryBuilder::PARAM_INT))

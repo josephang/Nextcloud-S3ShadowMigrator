@@ -39,18 +39,6 @@ class MigrateFileCommand extends Command {
     }
 
     protected function execute(InputInterface $input, OutputInterface $output): int {
-        $s3BucketIdentifier = $this->config->getAppValue('s3shadowmigrator', 's3_bucket_identifier', '');
-        if (empty($s3BucketIdentifier)) {
-            $output->writeln('<error>S3 Bucket Identifier is not configured. Run: occ config:app:set s3shadowmigrator s3_bucket_identifier --value="amazon::external::..."</error>');
-            return Command::FAILURE;
-        }
-
-        $s3StorageId = $this->fileCacheUpdater->getS3StorageId($s3BucketIdentifier);
-        if ($s3StorageId === null) {
-            $output->writeln("<error>Storage '{$s3BucketIdentifier}' not found in oc_storages. Is the External Storage mounted and accessible?</error>");
-            return Command::FAILURE;
-        }
-
         $fileIdArg = $input->getArgument('fileid');
 
         if ($fileIdArg !== null) {
@@ -61,8 +49,8 @@ class MigrateFileCommand extends Command {
                 return Command::FAILURE;
             }
 
-            $output->writeln("Migrating File ID {$fileId} to S3 (bucket identifier: {$s3BucketIdentifier})...");
-            $success = $this->migrationService->migrateFileById($fileId, $s3StorageId);
+            $output->writeln("Migrating File ID {$fileId} to S3...");
+            $success = $this->migrationService->migrateFileById($fileId);
 
             if ($success) {
                 $output->writeln("<info>✓ File ID {$fileId} successfully migrated to S3.</info>");
@@ -78,7 +66,7 @@ class MigrateFileCommand extends Command {
             $sizeLabel = $maxSizeBytes > 0 ? ' (max ' . round($maxSizeBytes/1024/1024, 1) . ' MB each)' : '';
             $output->writeln("Running batch drain of up to {$batchLimit} files{$sizeLabel}...");
 
-            $filesToMigrate = $this->migrationService->getLocalFilesToMigrate($batchLimit, $s3StorageId, $maxSizeBytes);
+            $filesToMigrate = $this->migrationService->getLocalFilesToMigrate($batchLimit, $maxSizeBytes);
             $count = count($filesToMigrate);
 
             if ($count === 0) {

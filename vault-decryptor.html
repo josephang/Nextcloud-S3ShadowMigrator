@@ -1,0 +1,439 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Vault Decryptor</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    min-height: 100vh;
+    background: #0a0a10;
+    background-image:
+      radial-gradient(ellipse 80% 50% at 50% -10%, rgba(99,102,241,0.18) 0%, transparent 60%);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-family: 'Inter', system-ui, sans-serif;
+    color: #e2e8f0;
+    padding: 1.5rem;
+  }
+
+  .card {
+    background: rgba(20, 20, 32, 0.95);
+    border: 1px solid rgba(99,102,241,0.2);
+    border-radius: 20px;
+    padding: 2.5rem 2.5rem 2rem;
+    width: 100%;
+    max-width: 500px;
+    box-shadow:
+      0 0 0 1px rgba(255,255,255,0.04),
+      0 30px 80px rgba(0,0,0,0.6),
+      0 0 60px rgba(99,102,241,0.08);
+    backdrop-filter: blur(20px);
+  }
+
+  /* Header */
+  .header { display: flex; align-items: center; gap: 14px; margin-bottom: 2rem; }
+  .icon-wrap {
+    flex-shrink: 0;
+    width: 48px; height: 48px;
+    background: linear-gradient(135deg, #4f46e5, #7c3aed);
+    border-radius: 12px;
+    display: flex; align-items: center; justify-content: center;
+    box-shadow: 0 4px 20px rgba(99,102,241,0.4);
+    font-size: 24px;
+  }
+  .header-text h1 { font-size: 1.35rem; font-weight: 700; color: #f8fafc; letter-spacing: -0.02em; }
+  .header-text p  { font-size: 0.75rem; color: #64748b; margin-top: 3px; letter-spacing: 0.02em; }
+
+  /* Drop zone */
+  .drop-zone {
+    border: 2px dashed rgba(99,102,241,0.3);
+    border-radius: 14px;
+    padding: 2rem 1.5rem;
+    text-align: center;
+    cursor: pointer;
+    transition: all 0.25s ease;
+    margin-bottom: 1.25rem;
+    position: relative;
+    background: rgba(99,102,241,0.03);
+  }
+  .drop-zone:hover { border-color: rgba(99,102,241,0.6); background: rgba(99,102,241,0.07); }
+  .drop-zone.drag-over {
+    border-color: #6366f1;
+    background: rgba(99,102,241,0.1);
+    box-shadow: 0 0 0 4px rgba(99,102,241,0.1);
+  }
+  .drop-zone.has-file { border-style: solid; border-color: rgba(99,102,241,0.5); }
+  .drop-icon { font-size: 2.2rem; margin-bottom: 0.6rem; display: block; }
+  .drop-primary { font-size: 0.9rem; font-weight: 600; color: #cbd5e1; }
+  .drop-secondary { font-size: 0.78rem; color: #475569; margin-top: 4px; }
+  .file-name {
+    display: none;
+    font-size: 0.82rem;
+    color: #a5b4fc;
+    font-weight: 500;
+    margin-top: 6px;
+    word-break: break-all;
+  }
+  .drop-zone.has-file .file-name { display: block; }
+  #file-input { display: none; }
+
+  /* Key input */
+  .key-label {
+    font-size: 0.72rem;
+    font-weight: 600;
+    color: #64748b;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    margin-bottom: 6px;
+  }
+  .key-wrap {
+    position: relative;
+    margin-bottom: 1.25rem;
+  }
+  .key-wrap svg {
+    position: absolute;
+    left: 12px; top: 50%;
+    transform: translateY(-50%);
+    color: #475569;
+    pointer-events: none;
+  }
+  .key-input {
+    width: 100%;
+    background: rgba(255,255,255,0.04);
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 10px;
+    padding: 0.7rem 0.875rem 0.7rem 2.6rem;
+    color: #a5b4fc;
+    font-family: 'Courier New', monospace;
+    font-size: 0.75rem;
+    outline: none;
+    transition: border-color 0.2s, box-shadow 0.2s;
+  }
+  .key-input:focus {
+    border-color: rgba(99,102,241,0.5);
+    box-shadow: 0 0 0 3px rgba(99,102,241,0.1);
+  }
+  .key-input::placeholder { color: #334155; }
+
+  /* Toggle to show/hide key */
+  .key-toggle {
+    position: absolute; right: 10px; top: 50%; transform: translateY(-50%);
+    background: none; border: none; cursor: pointer;
+    color: #475569; font-size: 0.7rem; padding: 4px 6px;
+    border-radius: 4px; transition: color 0.2s;
+  }
+  .key-toggle:hover { color: #94a3b8; }
+
+  /* Progress */
+  .progress-wrap { margin-bottom: 1.25rem; display: none; }
+  .progress-meta { display: flex; justify-content: space-between; font-size: 0.75rem; color: #64748b; margin-bottom: 6px; }
+  .progress-bar { height: 5px; background: rgba(255,255,255,0.06); border-radius: 99px; overflow: hidden; }
+  .progress-fill {
+    height: 100%;
+    background: linear-gradient(90deg, #4f46e5, #7c3aed, #a855f7);
+    border-radius: 99px;
+    width: 0%;
+    transition: width 0.15s ease;
+  }
+
+  /* Button */
+  .btn {
+    width: 100%;
+    padding: 0.8rem;
+    border: none;
+    border-radius: 12px;
+    font-size: 0.95rem;
+    font-weight: 600;
+    font-family: inherit;
+    cursor: pointer;
+    transition: all 0.2s ease;
+    letter-spacing: -0.01em;
+    background: linear-gradient(135deg, #4f46e5 0%, #7c3aed 100%);
+    color: white;
+    box-shadow: 0 4px 24px rgba(99,102,241,0.35);
+    position: relative;
+    overflow: hidden;
+  }
+  .btn::after {
+    content: '';
+    position: absolute; inset: 0;
+    background: linear-gradient(rgba(255,255,255,0.12), transparent);
+    pointer-events: none;
+  }
+  .btn:hover:not(:disabled) { transform: translateY(-1px); box-shadow: 0 6px 28px rgba(99,102,241,0.45); }
+  .btn:active:not(:disabled) { transform: translateY(0); }
+  .btn:disabled { opacity: 0.35; cursor: not-allowed; transform: none; box-shadow: none; }
+
+  /* Status messages */
+  .status {
+    margin-top: 1rem;
+    padding: 0.75rem 1rem;
+    border-radius: 10px;
+    font-size: 0.83rem;
+    line-height: 1.5;
+    display: none;
+    animation: fadeIn 0.2s ease;
+  }
+  @keyframes fadeIn { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: none; } }
+  .status.error   { background: rgba(239,68,68,0.08); border: 1px solid rgba(239,68,68,0.25); color: #fca5a5; }
+  .status.success { background: rgba(34,197,94,0.08); border: 1px solid rgba(34,197,94,0.25); color: #86efac; }
+
+  /* Footer note */
+  .footer-note {
+    margin-top: 1.5rem;
+    text-align: center;
+    font-size: 0.7rem;
+    color: #334155;
+    line-height: 1.6;
+  }
+  .footer-note a { color: #4f46e5; text-decoration: none; }
+</style>
+</head>
+<body>
+
+<div class="card">
+  <div class="header">
+    <div class="icon-wrap">🔓</div>
+    <div class="header-text">
+      <h1>Vault Decryptor</h1>
+      <p>AES-256-CTR · Client-side · Zero server contact</p>
+    </div>
+  </div>
+
+  <!-- Drop Zone -->
+  <div class="drop-zone" id="drop-zone">
+    <span class="drop-icon">📁</span>
+    <div class="drop-primary">Drop your <code>.enc</code> file here</div>
+    <div class="drop-secondary">or click to browse</div>
+    <div class="file-name" id="file-name-label"></div>
+  </div>
+  <input type="file" id="file-input">
+
+  <!-- Key input -->
+  <div class="key-label">AES-256 Master Key</div>
+  <div class="key-wrap">
+    <svg width="15" height="15" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+      <path stroke-linecap="round" stroke-linejoin="round" d="M15 7a2 2 0 012 2m4 0a6 6 0 01-7.743 5.743L11 17H9v2H7v2H4a1 1 0 01-1-1v-2.586a1 1 0 01.293-.707l5.964-5.964A6 6 0 1121 9z"/>
+    </svg>
+    <input
+      class="key-input"
+      id="vault-key"
+      type="password"
+      placeholder="64-character hex key (e.g. 60c93b53...)"
+      maxlength="64"
+      autocomplete="off"
+      spellcheck="false"
+    >
+    <button class="key-toggle" id="key-toggle" title="Show/hide key">Show</button>
+  </div>
+
+  <!-- Progress -->
+  <div class="progress-wrap" id="progress-wrap">
+    <div class="progress-meta">
+      <span id="progress-label">Decrypting…</span>
+      <span id="progress-pct">0%</span>
+    </div>
+    <div class="progress-bar"><div class="progress-fill" id="progress-fill"></div></div>
+  </div>
+
+  <button class="btn" id="decrypt-btn" disabled>🔓 &nbsp;Decrypt &amp; Download</button>
+  <div class="status" id="status"></div>
+
+  <div class="footer-note">
+    Decryption happens entirely in your browser.<br>
+    Your key and files <strong>never leave this page</strong>.
+  </div>
+</div>
+
+<script>
+'use strict';
+
+const dropZone     = document.getElementById('drop-zone');
+const fileInput    = document.getElementById('file-input');
+const keyInput     = document.getElementById('vault-key');
+const keyToggle    = document.getElementById('key-toggle');
+const btn          = document.getElementById('decrypt-btn');
+const statusEl     = document.getElementById('status');
+const progressWrap = document.getElementById('progress-wrap');
+const progressFill = document.getElementById('progress-fill');
+const progressLabel= document.getElementById('progress-label');
+const progressPct  = document.getElementById('progress-pct');
+const fileNameLabel= document.getElementById('file-name-label');
+
+let selectedFile = null;
+
+// ── File selection ──────────────────────────────────────────────────────────
+
+function setFile(file) {
+  selectedFile = file;
+  dropZone.classList.add('has-file');
+  fileNameLabel.textContent = `${file.name} · ${formatSize(file.size)}`;
+  updateBtn();
+  hideStatus();
+}
+
+dropZone.addEventListener('click', () => fileInput.click());
+fileInput.addEventListener('change', e => { if (e.target.files[0]) setFile(e.target.files[0]); });
+dropZone.addEventListener('dragover', e => { e.preventDefault(); dropZone.classList.add('drag-over'); });
+dropZone.addEventListener('dragleave', () => dropZone.classList.remove('drag-over'));
+dropZone.addEventListener('drop', e => {
+  e.preventDefault();
+  dropZone.classList.remove('drag-over');
+  if (e.dataTransfer.files[0]) setFile(e.dataTransfer.files[0]);
+});
+
+// ── Key toggle ──────────────────────────────────────────────────────────────
+
+keyToggle.addEventListener('click', () => {
+  const isPassword = keyInput.type === 'password';
+  keyInput.type = isPassword ? 'text' : 'password';
+  keyToggle.textContent = isPassword ? 'Hide' : 'Show';
+});
+
+keyInput.addEventListener('input', () => { updateBtn(); hideStatus(); });
+
+function updateBtn() {
+  btn.disabled = !(selectedFile && isValidKey(keyInput.value.trim()));
+}
+
+function isValidHex(str, expectedLen) {
+  return typeof str === 'string' && str.length === expectedLen && /^[0-9a-fA-F]+$/.test(str);
+}
+
+function isValidKey(k) {
+  return isValidHex(k, 64);
+}
+
+// ── Decrypt ─────────────────────────────────────────────────────────────────
+
+btn.addEventListener('click', async () => {
+  if (!selectedFile) return;
+  const keyHex = keyInput.value.trim();
+  if (!isValidKey(keyHex)) {
+    showStatus('Invalid key — must be exactly 64 hex characters (32 bytes).', 'error');
+    return;
+  }
+
+  btn.disabled = true;
+  hideStatus();
+  setProgress('Reading file…', 5);
+
+  try {
+    const encBuffer = await readFileAsArrayBuffer(selectedFile);
+    const encBytes  = new Uint8Array(encBuffer);
+
+    // Layout: [32 bytes ASCII hex IV][ciphertext...]
+    const ivHex = new TextDecoder('ascii').decode(encBytes.slice(0, 32));
+
+    // IV is 16 bytes = 32 hex chars (NOT 64 — that's the key length)
+    if (!isValidHex(ivHex, 32)) {
+      throw new Error(
+        'This file does not appear to be a Vault-encrypted file. ' +
+        'The first 32 bytes are not a valid 128-bit hex IV. ' +
+        'Make sure you downloaded the .enc file, not the raw file. ' +
+        '(First 32 bytes: ' + ivHex + ')'
+      );
+    }
+
+    const ivBytes    = hexToU8(ivHex);
+    const ciphertext = encBytes.slice(32);
+
+    setProgress('Importing key…', 25);
+    const cryptoKey = await crypto.subtle.importKey(
+      'raw',
+      hexToU8(keyHex),
+      { name: 'AES-CTR' },
+      false,
+      ['decrypt']
+    );
+
+    setProgress('Decrypting…', 50);
+
+    // AES-256-CTR with 128-bit counter block — matches OpenSSL `enc -aes-256-ctr`
+    const decrypted = await crypto.subtle.decrypt(
+      { name: 'AES-CTR', counter: ivBytes, length: 128 },
+      cryptoKey,
+      ciphertext
+    );
+
+    setProgress('Preparing download…', 90);
+
+    // Strip .enc suffix to restore original filename
+    const outName = selectedFile.name.toLowerCase().endsWith('.enc')
+      ? selectedFile.name.slice(0, -4)
+      : selectedFile.name + '.decrypted';
+
+    triggerDownload(decrypted, outName);
+
+    setProgress('Done!', 100);
+    showStatus(`✅ Successfully decrypted → ${outName}  (${formatSize(decrypted.byteLength)})`, 'success');
+
+  } catch (err) {
+    setProgress('', 0);
+    progressWrap.style.display = 'none';
+    showStatus('❌ ' + (err.message || 'Unknown error'), 'error');
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+// ── Helpers ─────────────────────────────────────────────────────────────────
+
+function readFileAsArrayBuffer(file) {
+  return new Promise((resolve, reject) => {
+    const fr = new FileReader();
+    fr.onload  = () => resolve(fr.result);
+    fr.onerror = () => reject(new Error('Failed to read file'));
+    fr.readAsArrayBuffer(file);
+  });
+}
+
+function hexToU8(hex) {
+  const out = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < out.length; i++)
+    out[i] = parseInt(hex.substr(i * 2, 2), 16);
+  return out;
+}
+
+function triggerDownload(buffer, filename) {
+  const blob = new Blob([buffer]);
+  const url  = URL.createObjectURL(blob);
+  const a    = Object.assign(document.createElement('a'), { href: url, download: filename });
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 10000);
+}
+
+function setProgress(label, pct) {
+  progressWrap.style.display = 'block';
+  progressLabel.textContent  = label;
+  progressPct.textContent    = pct + '%';
+  progressFill.style.width   = pct + '%';
+}
+
+function showStatus(msg, type) {
+  statusEl.textContent = msg;
+  statusEl.className   = 'status ' + type;
+  statusEl.style.display = 'block';
+}
+
+function hideStatus() {
+  statusEl.style.display = 'none';
+}
+
+function formatSize(bytes) {
+  if (bytes < 1024)        return bytes + ' B';
+  if (bytes < 1048576)     return (bytes / 1024).toFixed(1) + ' KB';
+  if (bytes < 1073741824)  return (bytes / 1048576).toFixed(2) + ' MB';
+  return (bytes / 1073741824).toFixed(2) + ' GB';
+}
+</script>
+</body>
+</html>

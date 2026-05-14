@@ -34,8 +34,8 @@ class SelfHealingJob extends TimedJob {
         $this->db             = $db;
         $this->logger         = $logger;
 
-        // Run every 5 minutes
-        $this->setInterval(300);
+        // Run every 30 minutes
+        $this->setInterval(1800);
 
         // Tell Nextcloud to enforce single-instance: sets reserved_at on start,
         // clears it on completion. Prevents double-runs.
